@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { View, Text, ScrollView, StyleSheet, Pressable } from 'react-native';
+import { T } from '../theme/tokens';
 
 interface Log {
   verified_at: string;
@@ -33,8 +34,6 @@ export function AttendanceHeatmap({ logs, trackingStartDate, endDate, cancelledD
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Attendance History</Text>
-      
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
         {months.map((monthDate, idx) => {
           const year = monthDate.getFullYear();
@@ -74,27 +73,27 @@ export function AttendanceHeatmap({ logs, trackingStartDate, endDate, cancelledD
                   const isWeekend = dObj.getDay() === 0 || dObj.getDay() === 6;
                   const isFuture = dateStr > todayStr;
 
-                  let color = "#f9fafb"; // var(--color-bg) equivalent, light grey
+                  let color = T.colors.bg;
                   let status = "Not yet tracked";
                   let isDashed = false;
 
                   if (isPreStart) {
-                    color = "#e5e7eb"; // border
+                    color = T.colors.border;
                     status = "Not yet tracked";
                   } else if (isCancelled) {
-                    color = "#9ca3af"; // text-muted
+                    color = T.colors.textMuted;
                     status = "Holiday";
                   } else if (isWeekend) {
-                    color = "#e5e7eb"; // border
+                    color = T.colors.border;
                     status = "Weekend";
                   } else if (isPresent) {
-                    color = "#10b981"; // success green
+                    color = T.colors.success;
                     status = "Present";
                   } else if (!isFuture) {
-                    color = "#ef4444"; // error red
+                    color = T.colors.error;
                     status = "Absent";
                   } else {
-                    color = "#f9fafb"; // future
+                    color = T.colors.bg;
                     status = "Future";
                     isDashed = true;
                   }
@@ -122,15 +121,15 @@ export function AttendanceHeatmap({ logs, trackingStartDate, endDate, cancelledD
       <View style={styles.footerContainer}>
         <View style={styles.legendContainer}>
           <View style={styles.legendItem}>
-            <View style={[styles.legendBox, { backgroundColor: "#10b981" }]} />
+            <View style={[styles.legendBox, { backgroundColor: T.colors.success }]} />
             <Text style={styles.legendText}>Present</Text>
           </View>
           <View style={styles.legendItem}>
-            <View style={[styles.legendBox, { backgroundColor: "#ef4444" }]} />
+            <View style={[styles.legendBox, { backgroundColor: T.colors.error }]} />
             <Text style={styles.legendText}>Absent</Text>
           </View>
           <View style={styles.legendItem}>
-            <View style={[styles.legendBox, { backgroundColor: "#9ca3af" }]} />
+            <View style={[styles.legendBox, { backgroundColor: T.colors.textMuted }]} />
             <Text style={styles.legendText}>Holiday</Text>
           </View>
         </View>
@@ -147,21 +146,8 @@ export function AttendanceHeatmap({ logs, trackingStartDate, endDate, cancelledD
 
 const styles = StyleSheet.create({
   container: {
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    padding: 16,
-    marginBottom: 20,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  title: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginBottom: 12,
-    color: '#111827',
+    backgroundColor: 'transparent',
+    padding: 0,
   },
   scrollContent: {
     paddingBottom: 8,
@@ -174,7 +160,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     textAlign: 'center',
     marginBottom: 8,
-    color: '#374151',
+    color: T.colors.textSecondary,
   },
   grid: {
     flexDirection: 'row',
@@ -185,7 +171,7 @@ const styles = StyleSheet.create({
     width: 16,
     fontSize: 10,
     textAlign: 'center',
-    color: '#6b7280',
+    color: T.colors.textSecondary,
     marginRight: 4,
     marginBottom: 4,
   },
@@ -198,12 +184,12 @@ const styles = StyleSheet.create({
   },
   cellDashed: {
     borderWidth: 1,
-    borderColor: '#e5e7eb',
+    borderColor: T.colors.border,
     borderStyle: 'dashed',
   },
   cellActive: {
     borderWidth: 2,
-    borderColor: '#3b82f6', // blue highlight for tapped cell
+    borderColor: T.colors.primary, // highlight for tapped cell
   },
   footerContainer: {
     marginTop: 12,
@@ -226,7 +212,7 @@ const styles = StyleSheet.create({
   },
   legendText: {
     fontSize: 12,
-    color: '#4b5563',
+    color: T.colors.textSecondary,
   },
   tooltipContainer: {
     minHeight: 20,
@@ -234,6 +220,6 @@ const styles = StyleSheet.create({
   tooltipText: {
     fontSize: 14,
     fontWeight: '500',
-    color: '#1f2937',
+    color: T.colors.text,
   }
 });

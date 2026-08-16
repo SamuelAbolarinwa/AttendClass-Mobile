@@ -1,11 +1,23 @@
 import React, { useState } from 'react';
-import { View, Text, StyleSheet, TextInput, TouchableOpacity, ActivityIndicator, Alert, ScrollView } from 'react-native';
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  StyleSheet,
+  ActivityIndicator,
+  Alert,
+  ScrollView,
+  StatusBar,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
+import { T } from '../theme/tokens';
 
 export default function SettingsScreen({ navigation }: any) {
   const { account, signOut } = useAuth();
-  
+
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -39,11 +51,9 @@ export default function SettingsScreen({ navigation }: any) {
       });
 
       if (rpcErr) throw rpcErr;
-      
+
       const res = data as any;
-      if (!res.ok) {
-        throw new Error(res.error || 'Failed to change password.');
-      }
+      if (!res.ok) throw new Error(res.error || 'Failed to change password.');
 
       setSuccess(true);
       setCurrentPassword('');
@@ -51,7 +61,6 @@ export default function SettingsScreen({ navigation }: any) {
       setConfirmPassword('');
       Alert.alert('Success', 'Your password has been changed.');
     } catch (err: any) {
-      console.error(err);
       setError(err.message || 'An unexpected error occurred.');
     } finally {
       setLoading(false);
@@ -59,213 +68,262 @@ export default function SettingsScreen({ navigation }: any) {
   };
 
   const handleLogOut = () => {
-    Alert.alert(
-      'Log Out',
-      'Are you sure you want to log out?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Log Out', style: 'destructive', onPress: signOut },
-      ]
-    );
+    Alert.alert('Log Out', 'Are you sure you want to log out?', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Log Out', style: 'destructive', onPress: signOut },
+    ]);
   };
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
+    <SafeAreaView style={styles.safeArea} edges={['top']}>
+      <StatusBar barStyle="dark-content" backgroundColor={T.colors.surface} />
+
+      {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
-          <Text style={styles.backButtonText}>←</Text>
+        <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
+          <Text style={styles.backArrow}>←</Text>
         </TouchableOpacity>
-        <Text style={styles.title}>Settings</Text>
+        <Text style={styles.headerTitle}>Settings</Text>
       </View>
 
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Change Password</Text>
-        
-        {error ? <Text style={styles.errorText}>{error}</Text> : null}
-        {success ? <Text style={styles.successText}>Password changed successfully!</Text> : null}
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
 
-        <View style={styles.inputGroup}>
-          <Text style={styles.label}>Current Password</Text>
-          <TextInput
-            style={styles.input}
-            secureTextEntry
-            placeholder="Enter current password"
-            value={currentPassword}
-            onChangeText={setCurrentPassword}
-          />
+        {/* Account info pill */}
+        <View style={styles.accountCard}>
+          <View style={styles.avatar}>
+            <Text style={styles.avatarInitial}>
+              {account?.full_name?.[0]?.toUpperCase() ?? '?'}
+            </Text>
+          </View>
+          <View>
+            <Text style={styles.accountName}>{account?.full_name}</Text>
+            <Text style={styles.accountRole}>{account?.role}</Text>
+          </View>
         </View>
 
-        <View style={styles.inputGroup}>
-          <Text style={styles.label}>New Password</Text>
-          <TextInput
-            style={styles.input}
-            secureTextEntry
-            placeholder="Enter new password"
-            value={newPassword}
-            onChangeText={setNewPassword}
-          />
+        {/* Change Password */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Change Password</Text>
+
+          {error ? (
+            <View style={styles.errorBox}>
+              <Text style={styles.errorText}>{error}</Text>
+            </View>
+          ) : null}
+          {success ? (
+            <View style={styles.successBox}>
+              <Text style={styles.successText}>Password changed successfully!</Text>
+            </View>
+          ) : null}
+
+          {[
+            { label: 'Current Password', value: currentPassword, setter: setCurrentPassword },
+            { label: 'New Password', value: newPassword, setter: setNewPassword },
+            { label: 'Confirm New Password', value: confirmPassword, setter: setConfirmPassword },
+          ].map(({ label, value, setter }) => (
+            <View key={label} style={styles.fieldGroup}>
+              <Text style={styles.label}>{label}</Text>
+              <TextInput
+                style={styles.input}
+                secureTextEntry
+                placeholder={`Enter ${label.toLowerCase()}`}
+                placeholderTextColor={T.colors.inputPlaceholder}
+                value={value}
+                onChangeText={setter}
+                // ── Fix: explicit text color prevents invisible text ──
+                color={T.colors.inputText}
+              />
+            </View>
+          ))}
+
+          <TouchableOpacity
+            style={[styles.primaryBtn, loading && styles.disabledBtn]}
+            onPress={handleChangePassword}
+            disabled={loading}
+            activeOpacity={0.85}
+          >
+            {loading ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.primaryBtnText}>Update Password</Text>
+            )}
+          </TouchableOpacity>
         </View>
 
-        <View style={styles.inputGroup}>
-          <Text style={styles.label}>Confirm New Password</Text>
-          <TextInput
-            style={styles.input}
-            secureTextEntry
-            placeholder="Confirm new password"
-            value={confirmPassword}
-            onChangeText={setConfirmPassword}
-          />
+        {/* Face Recognition */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Face Recognition</Text>
+          <Text style={styles.helperText}>
+            If you're having trouble checking in, you can re-enroll your face data.
+          </Text>
+          <TouchableOpacity
+            style={styles.outlineBtn}
+            onPress={() => navigation.navigate('EnrollFace')}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.outlineBtnText}>Re-enroll Face</Text>
+          </TouchableOpacity>
         </View>
 
-        <TouchableOpacity 
-          style={styles.button} 
-          onPress={handleChangePassword} 
-          disabled={loading}
-        >
-          {loading ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.buttonText}>Update Password</Text>
-          )}
+        {/* Log Out */}
+        <TouchableOpacity style={styles.dangerBtn} onPress={handleLogOut} activeOpacity={0.8}>
+          <Text style={styles.dangerBtnText}>Log Out</Text>
         </TouchableOpacity>
-      </View>
 
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Face Recognition</Text>
-        <Text style={styles.helperText}>
-          If you are having trouble checking in, you can re-enroll your face data.
-        </Text>
-        <TouchableOpacity 
-          style={styles.outlineButton}
-          onPress={() => navigation.navigate('EnrollFace')}
-        >
-          <Text style={styles.outlineButtonText}>Re-enroll Face</Text>
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.section}>
-        <TouchableOpacity 
-          style={styles.dangerButton}
-          onPress={handleLogOut}
-        >
-          <Text style={styles.dangerButtonText}>Log Out</Text>
-        </TouchableOpacity>
-      </View>
-    </ScrollView>
+        <View style={{ height: T.spacing.xxl }} />
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
+  safeArea: {
     flex: 1,
-    backgroundColor: '#f3f4f6',
-  },
-  scrollContent: {
-    padding: 20,
-    paddingTop: 60,
+    backgroundColor: T.colors.bg,
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 24,
+    backgroundColor: T.colors.surface,
+    paddingHorizontal: T.spacing.md,
+    paddingVertical: T.spacing.md,
+    borderBottomWidth: 1,
+    borderBottomColor: T.colors.border,
   },
-  backButton: {
-    marginRight: 16,
-    padding: 8,
+  backBtn: {
+    padding: T.spacing.sm,
+    marginRight: T.spacing.sm,
   },
-  backButtonText: {
-    fontSize: 24,
-    color: '#3b82f6',
+  backArrow: {
+    fontSize: T.fontSize.xl,
+    color: T.colors.primary,
+    fontWeight: '700',
   },
-  title: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#111827',
+  headerTitle: {
+    fontSize: T.fontSize.xl,
+    fontWeight: '700',
+    color: T.colors.text,
+  },
+  scroll: { flex: 1 },
+  scrollContent: {
+    padding: T.spacing.md,
+    gap: T.spacing.md,
+  },
+  accountCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: T.colors.surface,
+    borderRadius: T.radius.lg,
+    padding: T.spacing.md,
+    gap: T.spacing.md,
+    ...T.shadow.sm,
+  },
+  avatar: {
+    width: 48,
+    height: 48,
+    borderRadius: T.radius.full,
+    backgroundColor: T.colors.primary100,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarInitial: {
+    fontSize: T.fontSize.xl,
+    fontWeight: '700',
+    color: T.colors.primary600,
+  },
+  accountName: {
+    fontSize: T.fontSize.base,
+    fontWeight: '700',
+    color: T.colors.text,
+  },
+  accountRole: {
+    fontSize: T.fontSize.sm,
+    color: T.colors.textSecondary,
+    textTransform: 'capitalize',
+    marginTop: 2,
   },
   section: {
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    padding: 16,
-    marginBottom: 20,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 2,
-    elevation: 2,
+    backgroundColor: T.colors.surface,
+    borderRadius: T.radius.lg,
+    padding: T.spacing.md,
+    ...T.shadow.sm,
   },
   sectionTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginBottom: 16,
-    color: '#111827',
+    fontSize: T.fontSize.lg,
+    fontWeight: '700',
+    color: T.colors.text,
+    marginBottom: T.spacing.md,
   },
-  inputGroup: {
-    marginBottom: 16,
+  fieldGroup: {
+    marginBottom: T.spacing.md,
   },
   label: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#374151',
-    marginBottom: 8,
+    fontSize: T.fontSize.sm,
+    fontWeight: '600',
+    color: T.colors.textSecondary,
+    marginBottom: 6,
   },
   input: {
+    backgroundColor: T.colors.inputBg,
     borderWidth: 1,
-    borderColor: '#d1d5db',
-    borderRadius: 8,
-    padding: 12,
-    fontSize: 16,
-    backgroundColor: '#f9fafb',
+    borderColor: T.colors.inputBorder,
+    borderRadius: T.radius.md,
+    paddingHorizontal: T.spacing.md,
+    paddingVertical: T.spacing.sm + 4,
+    fontSize: T.fontSize.base,
+    // ── Fix: explicit text color ──
+    color: T.colors.inputText,
   },
   helperText: {
-    fontSize: 14,
-    color: '#6b7280',
-    marginBottom: 16,
+    fontSize: T.fontSize.sm,
+    color: T.colors.textSecondary,
+    marginBottom: T.spacing.md,
     lineHeight: 20,
   },
-  errorText: {
-    color: '#ef4444',
-    marginBottom: 12,
-    fontSize: 14,
-  },
-  successText: {
-    color: '#10b981',
-    marginBottom: 12,
-    fontSize: 14,
-  },
-  button: {
-    backgroundColor: '#3b82f6',
-    padding: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  outlineButton: {
+  errorBox: {
+    backgroundColor: T.colors.errorBg,
+    borderRadius: T.radius.md,
+    padding: T.spacing.sm + 4,
+    marginBottom: T.spacing.md,
     borderWidth: 1,
-    borderColor: '#3b82f6',
-    padding: 14,
-    borderRadius: 8,
-    alignItems: 'center',
+    borderColor: '#fecdd3',
   },
-  outlineButtonText: {
-    color: '#3b82f6',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  dangerButton: {
-    backgroundColor: '#fef2f2',
+  errorText: { color: T.colors.error, fontSize: T.fontSize.sm, fontWeight: '500' },
+  successBox: {
+    backgroundColor: T.colors.successBg,
+    borderRadius: T.radius.md,
+    padding: T.spacing.sm + 4,
+    marginBottom: T.spacing.md,
     borderWidth: 1,
-    borderColor: '#fca5a5',
-    padding: 14,
-    borderRadius: 8,
+    borderColor: '#6ee7b7',
+  },
+  successText: { color: T.colors.success, fontSize: T.fontSize.sm, fontWeight: '500' },
+  primaryBtn: {
+    backgroundColor: T.colors.primary,
+    borderRadius: T.radius.md,
+    paddingVertical: T.spacing.md,
+    alignItems: 'center',
+    ...T.shadow.md,
+    shadowColor: T.colors.primary,
+  },
+  disabledBtn: { opacity: 0.6 },
+  primaryBtnText: { color: '#fff', fontSize: T.fontSize.base, fontWeight: '700' },
+  outlineBtn: {
+    borderWidth: 1.5,
+    borderColor: T.colors.primary,
+    borderRadius: T.radius.md,
+    paddingVertical: T.spacing.md,
     alignItems: 'center',
   },
-  dangerButtonText: {
-    color: '#ef4444',
-    fontSize: 16,
-    fontWeight: 'bold',
-  }
+  outlineBtnText: { color: T.colors.primary, fontSize: T.fontSize.base, fontWeight: '700' },
+  dangerBtn: {
+    backgroundColor: T.colors.errorBg,
+    borderWidth: 1,
+    borderColor: '#fecdd3',
+    borderRadius: T.radius.lg,
+    paddingVertical: T.spacing.md,
+    alignItems: 'center',
+    ...T.shadow.sm,
+  },
+  dangerBtnText: { color: T.colors.error, fontSize: T.fontSize.base, fontWeight: '700' },
 });

@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, Button, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Alert, StatusBar } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Camera, useCameraDevice } from 'react-native-vision-camera';
 import { useTensorflowModel } from 'react-native-fast-tflite';
 import { BleManager, Device } from 'react-native-ble-plx';
@@ -8,6 +9,7 @@ import { Buffer } from 'buffer';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
 import { useFaceProcessor, LivenessState } from '../hooks/useFaceProcessor';
+import { T } from '../theme/tokens';
 
 type FlowStep = 'IDLE' | 'VERIFY_FACE' | 'CONNECT_BLE' | 'SUCCESS' | 'ALREADY_LOGGED' | 'FAILED';
 
@@ -166,17 +168,29 @@ export default function CheckInScreen({ navigation }: any) {
     setPrompt('Look straight ahead');
   };
 
+  // ── Step indicator for face capture ─────────────────────────────────────
+  const steps: LivenessState[] = ['WAITING', 'BLINK', 'TURN_LEFT', 'TURN_RIGHT', 'CAPTURING'];
+  const stepIdx = steps.indexOf(uiLivenessState);
+
   if (!hasPermission) {
     return (
-      <View style={styles.container}>
-        <Text>Camera permission is required.</Text>
-      </View>
+      <SafeAreaView style={styles.center}>
+        <Text style={styles.permissionIcon}>📷</Text>
+        <Text style={styles.permissionTitle}>Camera Permission Required</Text>
+        <Text style={styles.permissionText}>
+          Please grant camera access in Settings to check in.
+        </Text>
+        <TouchableOpacity style={styles.primaryBtn} onPress={() => navigation.goBack()}>
+          <Text style={styles.primaryBtnText}>Go Back</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
     );
   }
 
   if (step === 'VERIFY_FACE') {
     return (
       <View style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="black" />
         {device ? (
           <Camera
             style={StyleSheet.absoluteFill}
@@ -186,20 +200,45 @@ export default function CheckInScreen({ navigation }: any) {
             frameProcessor={frameProcessor}
           />
         ) : (
-          <Text>No camera available.</Text>
+          <Text style={{color: 'white'}}>No camera available.</Text>
         )}
         
-        <View style={styles.overlay}>
+        {/* Top header */}
+        <SafeAreaView edges={['top']} style={styles.topHeader}>
+          <TouchableOpacity style={styles.backBtnLight} onPress={() => navigation.goBack()}>
+            <Text style={styles.backArrowLight}>←</Text>
+          </TouchableOpacity>
+          <View style={{ alignItems: 'center' }}>
+            <Text style={styles.headerTitleLight}>Face Verification</Text>
+            <Text style={styles.headerSubLight}>Step {Math.max(1, stepIdx + 1)} of {steps.length}</Text>
+          </View>
+          <View style={{ width: 44 }} /> 
+        </SafeAreaView>
+
+        {/* Bottom card */}
+        <View style={styles.bottomCard}>
+          <View style={styles.dots}>
+            {steps.map((s, i) => (
+              <View key={s} style={[styles.dot, i <= stepIdx && styles.dotActive]} />
+            ))}
+          </View>
           <Text style={styles.prompt}>{prompt}</Text>
-          {uiLivenessState === 'DONE' && <ActivityIndicator size="large" color="#fff" />}
-          {__DEV__ && (
-            <Button 
-              title="[DEV Bypass Liveness]" 
+          {uiLivenessState === 'DONE' && (
+            <View style={styles.enrollingRow}>
+              <ActivityIndicator color={T.colors.primary} />
+              <Text style={styles.enrollingText}>Verifying face...</Text>
+            </View>
+          )}
+          {__DEV__ && uiLivenessState !== 'DONE' && (
+            <TouchableOpacity
+              style={styles.devBypassBtn}
               onPress={() => {
                 const mockEmbedding = Array(192).fill(0).map(() => Math.random() * 2 - 1);
                 handleFaceMatch(mockEmbedding);
-              }} 
-            />
+              }}
+            >
+              <Text style={styles.devBypassText}>[DEV] Bypass Verification</Text>
+            </TouchableOpacity>
           )}
         </View>
       </View>
@@ -207,47 +246,56 @@ export default function CheckInScreen({ navigation }: any) {
   }
 
   return (
-    <View style={styles.container}>
-      <View style={styles.messageBox}>
+    <SafeAreaView style={styles.center} edges={['top', 'bottom']}>
+      <StatusBar barStyle="dark-content" backgroundColor={T.colors.bg} />
+      <View style={styles.messageCard}>
         {step === 'CONNECT_BLE' && (
           <>
-            <ActivityIndicator size="large" color="#2196F3" />
+            <ActivityIndicator size="large" color={T.colors.primary} style={{ marginBottom: T.spacing.md }} />
             <Text style={styles.statusText}>{prompt}</Text>
+            <Text style={styles.subText}>Make sure Bluetooth is turned on.</Text>
           </>
         )}
         
         {step === 'SUCCESS' && (
           <>
             <Text style={styles.emoji}>✅</Text>
-            <Text style={styles.title}>Check-In Successful</Text>
-            <Text style={styles.text}>Your attendance has been securely verified and logged.</Text>
-            <Button title="Done" onPress={() => navigation.goBack()} />
+            <Text style={styles.cardTitle}>Check-In Successful</Text>
+            <Text style={styles.cardText}>Your attendance has been securely verified and logged.</Text>
+            <TouchableOpacity style={styles.primaryBtn} onPress={() => navigation.goBack()}>
+              <Text style={styles.primaryBtnText}>Done</Text>
+            </TouchableOpacity>
           </>
         )}
 
         {step === 'ALREADY_LOGGED' && (
           <>
             <Text style={styles.emoji}>📋</Text>
-            <Text style={styles.title}>Already Checked In</Text>
-            <Text style={styles.text}>You already checked in for this class today.</Text>
-            <Button title="Done" onPress={() => navigation.goBack()} />
+            <Text style={styles.cardTitle}>Already Checked In</Text>
+            <Text style={styles.cardText}>You already checked in for this class today.</Text>
+            <TouchableOpacity style={styles.primaryBtn} onPress={() => navigation.goBack()}>
+              <Text style={styles.primaryBtnText}>Done</Text>
+            </TouchableOpacity>
           </>
         )}
 
         {step === 'FAILED' && (
           <>
             <Text style={styles.emoji}>❌</Text>
-            <Text style={styles.title}>Verification Failed</Text>
-            <Text style={styles.text}>{errorMsg}</Text>
-            <View style={styles.buttonRow}>
-              <Button title="Try Again" onPress={retry} />
-              <View style={{ width: 10 }} />
-              <Button title="Cancel" color="gray" onPress={() => navigation.goBack()} />
+            <Text style={styles.cardTitle}>Verification Failed</Text>
+            <View style={styles.errorBox}>
+              <Text style={styles.errorText}>{errorMsg}</Text>
             </View>
+            <TouchableOpacity style={styles.primaryBtn} onPress={retry}>
+              <Text style={styles.primaryBtnText}>Try Again</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.outlineBtn} onPress={() => navigation.goBack()}>
+              <Text style={styles.outlineBtnText}>Cancel</Text>
+            </TouchableOpacity>
           </>
         )}
       </View>
-    </View>
+    </SafeAreaView>
   );
 }
 
@@ -255,57 +303,158 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: 'black',
-    justifyContent: 'center',
-    alignItems: 'center',
   },
-  overlay: {
-    position: 'absolute',
-    bottom: 50,
-    left: 20,
-    right: 20,
+  center: {
+    flex: 1,
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    padding: 20,
-    borderRadius: 10,
+    justifyContent: 'center',
+    backgroundColor: T.colors.bg,
+    padding: T.spacing.lg,
+  },
+  permissionIcon: {
+    fontSize: 48,
+    marginBottom: T.spacing.md,
+  },
+  permissionTitle: {
+    fontSize: T.fontSize.xl,
+    fontWeight: '700',
+    color: T.colors.text,
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  permissionText: {
+    fontSize: T.fontSize.sm,
+    color: T.colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: T.spacing.lg,
+  },
+  topHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: T.spacing.md,
+    paddingTop: T.spacing.sm,
+  },
+  backBtnLight: { padding: T.spacing.xs },
+  backArrowLight: { fontSize: T.fontSize.xl, color: '#fff', fontWeight: '700' },
+  headerTitleLight: {
+    color: '#fff',
+    fontSize: T.fontSize.lg,
+    fontWeight: '700',
+    textShadowColor: 'rgba(0,0,0,0.6)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+  },
+  headerSubLight: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: T.fontSize.xs,
+    marginTop: 2,
+  },
+  bottomCard: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(15,23,42,0.88)',
+    padding: T.spacing.lg,
+    paddingBottom: T.spacing.xxl,
+    borderTopLeftRadius: T.radius.xl,
+    borderTopRightRadius: T.radius.xl,
+  },
+  dots: {
+    flexDirection: 'row',
+    gap: 8,
+    justifyContent: 'center',
+    marginBottom: T.spacing.md,
+  },
+  dot: {
+    width: 8,
+    height: 8,
+    borderRadius: T.radius.full,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+  },
+  dotActive: {
+    backgroundColor: T.colors.primary,
+    width: 20,
   },
   prompt: {
-    color: 'white',
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 10,
+    color: '#fff',
+    fontSize: T.fontSize.xl,
+    fontWeight: '700',
     textAlign: 'center',
+    marginBottom: T.spacing.md,
   },
-  messageBox: {
-    backgroundColor: 'white',
-    padding: 24,
-    borderRadius: 12,
-    alignItems: 'center',
-    width: '85%',
-  },
-  emoji: {
-    fontSize: 48,
-    marginBottom: 16,
-  },
-  title: {
-    fontSize: 22,
-    fontWeight: 'bold',
-    marginBottom: 12,
-    color: '#333',
-  },
-  text: {
-    fontSize: 16,
-    color: '#666',
-    textAlign: 'center',
-    marginBottom: 24,
-  },
-  statusText: {
-    marginTop: 16,
-    fontSize: 16,
-    color: '#333',
-    textAlign: 'center',
-  },
-  buttonRow: {
+  enrollingRow: {
     flexDirection: 'row',
+    alignItems: 'center',
     justifyContent: 'center',
-  }
+    gap: T.spacing.sm,
+  },
+  enrollingText: { color: T.colors.textMuted, fontSize: T.fontSize.sm },
+  devBypassBtn: {
+    marginTop: T.spacing.md,
+    paddingVertical: T.spacing.sm,
+    paddingHorizontal: T.spacing.md,
+    borderRadius: T.radius.md,
+    borderWidth: 1,
+    borderColor: T.colors.warning,
+    alignItems: 'center',
+  },
+  devBypassText: { color: T.colors.warning, fontSize: T.fontSize.sm, fontWeight: '600' },
+  
+  // Status screen styles
+  messageCard: {
+    backgroundColor: T.colors.surface,
+    padding: T.spacing.xl,
+    borderRadius: T.radius.xl,
+    width: '100%',
+    maxWidth: 400,
+    alignItems: 'center',
+    ...T.shadow.md,
+  },
+  emoji: { fontSize: 56, marginBottom: T.spacing.md },
+  cardTitle: {
+    fontSize: T.fontSize.xl,
+    fontWeight: '800',
+    color: T.colors.text,
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  cardText: {
+    fontSize: T.fontSize.base,
+    color: T.colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 22,
+    marginBottom: T.spacing.xl,
+  },
+  statusText: { fontSize: T.fontSize.lg, fontWeight: '700', color: T.colors.text, textAlign: 'center' },
+  subText: { fontSize: T.fontSize.sm, color: T.colors.textSecondary, textAlign: 'center', marginTop: 8 },
+  errorBox: {
+    backgroundColor: T.colors.errorBg,
+    borderRadius: T.radius.md,
+    padding: T.spacing.md,
+    borderWidth: 1,
+    borderColor: '#fecdd3',
+    marginBottom: T.spacing.xl,
+    width: '100%',
+  },
+  errorText: { color: T.colors.error, fontSize: T.fontSize.sm, textAlign: 'center' },
+  primaryBtn: {
+    backgroundColor: T.colors.primary,
+    borderRadius: T.radius.md,
+    paddingVertical: T.spacing.md,
+    paddingHorizontal: T.spacing.xl,
+    width: '100%',
+    alignItems: 'center',
+    ...T.shadow.sm,
+  },
+  primaryBtnText: { color: '#fff', fontSize: T.fontSize.base, fontWeight: '700' },
+  outlineBtn: {
+    marginTop: T.spacing.sm,
+    paddingVertical: T.spacing.md,
+    width: '100%',
+    alignItems: 'center',
+  },
+  outlineBtnText: { color: T.colors.textSecondary, fontSize: T.fontSize.base, fontWeight: '600' },
 });

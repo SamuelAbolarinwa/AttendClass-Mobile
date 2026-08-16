@@ -1,199 +1,182 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator } from 'react-native';
+import React, { useState } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
+  ActivityIndicator,
+  StatusBar,
+  RefreshControl,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
-import { getWorkingDays, isCountableDay, calculateAttendanceStats } from '../utils/attendanceHelpers';
+import { isCountableDay } from '../utils/attendanceHelpers';
 import { AttendanceHeatmap } from '../components/AttendanceHeatmap';
+import { T } from '../theme/tokens';
 
 export default function DashboardScreen({ navigation }: any) {
   const { account } = useAuth();
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [logs, setLogs] = useState<any[]>([]);
-  
   const [stats, setStats] = useState({ present: 0, absent: 0, percentage: 0 });
   const [error, setError] = useState<string | null>(null);
-  
   const [trackingStart, setTrackingStart] = useState<string>('');
   const [endDate, setEndDate] = useState<Date>(new Date());
   const [cancelledDays, setCancelledDays] = useState<Set<string>>(new Set());
 
   const fetchDashboardData = async () => {
     if (!account) return;
-    setLoading(true);
     setError(null);
 
     try {
-      // 1. Fetch user's profile
-      const { data: profileData, error: profileErr } = await supabase
-        .from('profiles')
-        .select('created_at, tracking_start_date')
-        .eq('id', account.id)
-        .single();
-      if (profileErr) throw profileErr;
+      const [profileRes, settingsRes, cancelledRes, logsRes] = await Promise.all([
+        supabase.from('profiles').select('created_at, tracking_start_date').eq('id', account.id).single(),
+        supabase.from('app_settings').select('tracking_period_end_date').single(),
+        supabase.from('cancelled_days').select('cancelled_date'),
+        supabase.rpc('platform_get_my_attendance', { p_token: account.token }),
+      ]);
 
-      // 2. Fetch global app_settings
-      const { data: settingsData, error: settingsErr } = await supabase
-        .from('app_settings')
-        .select('tracking_period_end_date')
-        .single();
-      if (settingsErr) throw settingsErr;
+      if (profileRes.error) throw profileRes.error;
+      if (settingsRes.error) throw settingsRes.error;
+      if (cancelledRes.error) throw cancelledRes.error;
+      if (logsRes.error) throw logsRes.error;
 
-      // 3. Fetch cancelled days
-      const { data: cancelledData, error: cancelledErr } = await supabase
-        .from('cancelled_days')
-        .select('cancelled_date');
-      if (cancelledErr) throw cancelledErr;
+      const res = logsRes.data as any;
+      if (!res.ok) throw new Error(res.error || 'Failed to fetch attendance');
 
-      const cancelledSet = new Set(cancelledData.map((d: any) => d.cancelled_date));
-
-      // 4. Fetch attendance via RPC
-      const { data: logsData, error: logsErr } = await supabase.rpc('platform_get_my_attendance', {
-        p_token: account.token
-      });
-      if (logsErr) throw logsErr;
-      
-      const res = logsData as any;
-      if (!res.ok) throw new Error(res.error || 'Failed to fetch attendance logs');
-      
       const userLogs = res.data || [];
       setLogs(userLogs);
 
-      // 5. Calculate Stats
-      const trackingStartStr = profileData.tracking_start_date || profileData.created_at.split('T')[0];
-      const endDateObj = settingsData?.tracking_period_end_date ? new Date(settingsData.tracking_period_end_date) : new Date();
-      
+      const cancelledSet = new Set<string>(cancelledRes.data.map((d: any) => d.cancelled_date));
+      const trackingStartStr = profileRes.data.tracking_start_date || profileRes.data.created_at.split('T')[0];
+      const endDateObj = settingsRes.data?.tracking_period_end_date
+        ? new Date(settingsRes.data.tracking_period_end_date)
+        : new Date();
+
       setTrackingStart(trackingStartStr);
       setEndDate(endDateObj);
       setCancelledDays(cancelledSet);
-      
+
       let presentCount = 0;
       let absentCount = 0;
-      
       const today = new Date();
       const end = endDateObj < today ? endDateObj : today;
 
-      // Count working days
       for (let d = new Date(trackingStartStr); d <= end; d.setDate(d.getDate() + 1)) {
         const dayStr = d.toISOString().split('T')[0];
-        
-        // Skip weekends
-        const dayOfWeek = d.getDay();
-        if (dayOfWeek === 0 || dayOfWeek === 6) continue;
-        
-        // Skip cancelled days
+        const dow = d.getDay();
+        if (dow === 0 || dow === 6) continue;
         if (!isCountableDay(dayStr, trackingStartStr, cancelledSet)) continue;
-
-        // Check if present
         const wasPresent = userLogs.some((log: any) => log.verified_at.startsWith(dayStr));
-        if (wasPresent) {
-          presentCount++;
-        } else {
-          absentCount++;
-        }
+        wasPresent ? presentCount++ : absentCount++;
       }
 
-      const totalCountable = presentCount + absentCount;
-      const percentage = totalCountable > 0 ? (presentCount / totalCountable) * 100 : 0;
-
-      setStats({
-        present: presentCount,
-        absent: absentCount,
-        percentage
-      });
-
+      const total = presentCount + absentCount;
+      setStats({ present: presentCount, absent: absentCount, percentage: total > 0 ? (presentCount / total) * 100 : 0 });
     } catch (err: any) {
-      console.error(err);
       setError(err.message);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   };
 
-  // Run on mount and when screen comes into focus
-  useEffect(() => {
-    const unsubscribe = navigation.addListener('focus', () => {
+  React.useEffect(() => {
+    const unsub = navigation.addListener('focus', () => {
+      setLoading(true);
       fetchDashboardData();
     });
-    return unsubscribe;
+    return unsub;
   }, [navigation, account]);
 
+  const onRefresh = () => {
+    setRefreshing(true);
+    fetchDashboardData();
+  };
+
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={styles.safeArea} edges={['top']}>
+      <StatusBar barStyle="dark-content" backgroundColor={T.colors.surface} />
+
+      {/* Header */}
       <View style={styles.header}>
-        <View style={styles.headerTextContainer}>
-          <Text style={styles.title}>My Attendance</Text>
-          <Text style={styles.subtitle}>Welcome back, {account?.full_name}</Text>
+        <View style={styles.headerLeft}>
+          <Text style={styles.greeting}>My Attendance</Text>
+          <Text style={styles.name}>👋 {account?.full_name}</Text>
         </View>
-        <TouchableOpacity 
-          style={styles.settingsButton}
-          onPress={() => navigation.navigate('Settings')}
-        >
-          <Text style={styles.settingsButtonText}>⚙️</Text>
+        <TouchableOpacity style={styles.settingsBtn} onPress={() => navigation.navigate('Settings')}>
+          <Text style={styles.settingsBtnText}>⚙️</Text>
         </TouchableOpacity>
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={T.colors.primary} />}
+      >
         {error && (
           <View style={styles.errorBox}>
-            <Text style={styles.errorText}>{error}</Text>
+            <Text style={styles.errorText}>⚠️ {error}</Text>
           </View>
         )}
 
-        {/* Stats Row */}
-        <View style={styles.statsContainer}>
-          <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Days Present</Text>
-            <Text style={[styles.statValue, { color: '#10b981' }]}>
-              {loading ? '-' : stats.present}
-            </Text>
-          </View>
-          <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Days Absent</Text>
-            <Text style={[styles.statValue, { color: '#ef4444' }]}>
-              {loading ? '-' : stats.absent}
-            </Text>
-          </View>
-          <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Attendance %</Text>
-            <Text style={[styles.statValue, { color: '#1f2937' }]}>
-              {loading ? '-' : `${stats.percentage.toFixed(1)}%`}
-            </Text>
-          </View>
+        {/* Stats row */}
+        <View style={styles.statsRow}>
+          {[
+            { label: 'Present', value: stats.present, color: T.colors.success },
+            { label: 'Absent', value: stats.absent, color: T.colors.error },
+            { label: 'Rate', value: `${stats.percentage.toFixed(0)}%`, color: T.colors.primary },
+          ].map(({ label, value, color }) => (
+            <View key={label} style={styles.statCard}>
+              <Text style={[styles.statValue, { color }]}>{loading ? '—' : value}</Text>
+              <Text style={styles.statLabel}>{label}</Text>
+            </View>
+          ))}
         </View>
 
         {/* Heatmap */}
         {loading ? (
-          <ActivityIndicator size="large" color="#3b82f6" style={styles.loader} />
+          <View style={styles.heatmapSkeleton}>
+            <ActivityIndicator color={T.colors.primary} />
+          </View>
         ) : trackingStart ? (
-          <AttendanceHeatmap
-            logs={logs}
-            trackingStartDate={trackingStart}
-            endDate={endDate}
-            cancelledDays={cancelledDays}
-          />
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Attendance Calendar</Text>
+            <AttendanceHeatmap
+              logs={logs}
+              trackingStartDate={trackingStart}
+              endDate={endDate}
+              cancelledDays={cancelledDays}
+            />
+          </View>
         ) : null}
 
-        {/* Recent History */}
-        <View style={styles.historyCard}>
-          <Text style={styles.historyTitle}>Recent History</Text>
+        {/* Recent history */}
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Recent History</Text>
           {loading ? (
-            <ActivityIndicator style={styles.loader} />
+            <ActivityIndicator color={T.colors.primary} style={styles.loader} />
           ) : logs.length === 0 ? (
-            <Text style={styles.emptyText}>No attendance records found.</Text>
+            <Text style={styles.emptyText}>No attendance records yet.</Text>
           ) : (
-            logs.slice(0, 10).map((log, index) => {
+            logs.slice(0, 10).map((log, idx) => {
               const d = new Date(log.verified_at);
               return (
-                <View key={log.id || index} style={styles.historyRow}>
+                <View key={log.id || idx} style={[styles.historyRow, idx === 0 && styles.historyRowFirst]}>
                   <View>
-                    <Text style={styles.historyDate}>{d.toLocaleDateString()}</Text>
-                    <Text style={styles.historyTime}>
-                      {d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </Text>
+                    <Text style={styles.historyDate}>{d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</Text>
+                    <Text style={styles.historyTime}>{d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</Text>
                   </View>
-                  <View style={styles.historyBadgeContainer}>
-                    <Text style={styles.badgeNeutral}>{log.method}</Text>
-                    <Text style={styles.badgeSuccess}>Present</Text>
+                  <View style={styles.badges}>
+                    <View style={styles.methodBadge}>
+                      <Text style={styles.methodBadgeText}>{log.method}</Text>
+                    </View>
+                    <View style={styles.presentBadge}>
+                      <Text style={styles.presentBadgeText}>Present</Text>
+                    </View>
                   </View>
                 </View>
               );
@@ -201,183 +184,103 @@ export default function DashboardScreen({ navigation }: any) {
           )}
         </View>
 
-        <View style={{ height: 100 }} /> 
+        <View style={{ height: 96 }} />
       </ScrollView>
 
-      {/* Floating Action Button for Check-in */}
-      <TouchableOpacity 
-        style={styles.fab} 
+      {/* FAB */}
+      <TouchableOpacity
+        style={styles.fab}
         onPress={() => navigation.navigate('CheckIn')}
-        activeOpacity={0.8}
+        activeOpacity={0.85}
       >
-        <Text style={styles.fabText}>Check In Now</Text>
+        <Text style={styles.fabText}>Check In Now →</Text>
       </TouchableOpacity>
-    </View>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f3f4f6',
-  },
+  safeArea: { flex: 1, backgroundColor: T.colors.bg },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: 20,
-    paddingTop: 60, // Adjust for status bar if not using SafeAreaView
-    backgroundColor: '#fff',
+    backgroundColor: T.colors.surface,
+    paddingHorizontal: T.spacing.lg,
+    paddingVertical: T.spacing.md,
     borderBottomWidth: 1,
-    borderBottomColor: '#e5e7eb',
+    borderBottomColor: T.colors.border,
   },
-  headerTextContainer: {
-    flex: 1,
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#111827',
-  },
-  subtitle: {
-    fontSize: 14,
-    color: '#6b7280',
-    marginTop: 4,
-  },
-  settingsButton: {
-    padding: 8,
-  },
-  settingsButtonText: {
-    fontSize: 24,
-  },
-  scrollContent: {
-    padding: 16,
-  },
+  headerLeft: { flex: 1 },
+  greeting: { fontSize: T.fontSize.xl, fontWeight: '800', color: T.colors.text },
+  name: { fontSize: T.fontSize.sm, color: T.colors.textSecondary, marginTop: 2 },
+  settingsBtn: { padding: T.spacing.sm },
+  settingsBtnText: { fontSize: 24 },
+  scroll: { flex: 1 },
+  scrollContent: { padding: T.spacing.md, gap: T.spacing.md },
   errorBox: {
-    backgroundColor: '#fef2f2',
-    padding: 12,
-    borderRadius: 8,
-    marginBottom: 16,
+    backgroundColor: T.colors.errorBg,
+    borderRadius: T.radius.md,
+    padding: T.spacing.md,
     borderWidth: 1,
-    borderColor: '#fca5a5',
+    borderColor: '#fecdd3',
   },
-  errorText: {
-    color: '#b91c1c',
-  },
-  statsContainer: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 20,
-    gap: 8,
-  },
+  errorText: { color: T.colors.error, fontSize: T.fontSize.sm },
+  statsRow: { flexDirection: 'row', gap: T.spacing.sm },
   statCard: {
     flex: 1,
-    backgroundColor: '#fff',
-    padding: 16,
-    borderRadius: 8,
+    backgroundColor: T.colors.surface,
+    borderRadius: T.radius.md,
+    padding: T.spacing.md,
     alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 2,
-    elevation: 2,
+    ...T.shadow.sm,
   },
-  statLabel: {
-    fontSize: 10,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    color: '#6b7280',
-    marginBottom: 8,
-    textAlign: 'center',
+  statValue: { fontSize: 28, fontWeight: '800' },
+  statLabel: { fontSize: T.fontSize.xs, fontWeight: '600', color: T.colors.textMuted, marginTop: 4, textTransform: 'uppercase', letterSpacing: 0.5 },
+  card: {
+    backgroundColor: T.colors.surface,
+    borderRadius: T.radius.lg,
+    padding: T.spacing.md,
+    ...T.shadow.sm,
   },
-  statValue: {
-    fontSize: 24,
-    fontWeight: 'bold',
+  cardTitle: { fontSize: T.fontSize.base, fontWeight: '700', color: T.colors.text, marginBottom: T.spacing.md },
+  heatmapSkeleton: {
+    backgroundColor: T.colors.surface,
+    borderRadius: T.radius.lg,
+    height: 160,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...T.shadow.sm,
   },
-  loader: {
-    marginVertical: 20,
-  },
-  historyCard: {
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    padding: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 2,
-    elevation: 2,
-  },
-  historyTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginBottom: 12,
-    color: '#111827',
-  },
-  emptyText: {
-    color: '#6b7280',
-    textAlign: 'center',
-    paddingVertical: 20,
-  },
+  loader: { paddingVertical: T.spacing.lg },
+  emptyText: { color: T.colors.textMuted, textAlign: 'center', paddingVertical: T.spacing.lg },
   historyRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+    justifyContent: 'space-between',
+    paddingVertical: T.spacing.sm + 4,
+    borderTopWidth: 1,
+    borderTopColor: T.colors.border,
   },
-  historyDate: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#1f2937',
-  },
-  historyTime: {
-    fontSize: 12,
-    color: '#6b7280',
-    marginTop: 2,
-  },
-  historyBadgeContainer: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  badgeNeutral: {
-    backgroundColor: '#f3f4f6',
-    color: '#374151',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
-    fontSize: 12,
-    fontWeight: '500',
-    overflow: 'hidden',
-  },
-  badgeSuccess: {
-    backgroundColor: '#d1fae5',
-    color: '#065f46',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
-    fontSize: 12,
-    fontWeight: '500',
-    overflow: 'hidden',
-  },
+  historyRowFirst: { borderTopWidth: 0 },
+  historyDate: { fontSize: T.fontSize.sm, fontWeight: '600', color: T.colors.text },
+  historyTime: { fontSize: T.fontSize.xs, color: T.colors.textMuted, marginTop: 2 },
+  badges: { flexDirection: 'row', gap: T.spacing.sm },
+  methodBadge: { backgroundColor: T.colors.bg, borderRadius: T.radius.full, paddingHorizontal: 10, paddingVertical: 4 },
+  methodBadgeText: { fontSize: T.fontSize.xs, fontWeight: '600', color: T.colors.textSecondary },
+  presentBadge: { backgroundColor: T.colors.successBg, borderRadius: T.radius.full, paddingHorizontal: 10, paddingVertical: 4 },
+  presentBadgeText: { fontSize: T.fontSize.xs, fontWeight: '600', color: T.colors.success },
   fab: {
     position: 'absolute',
-    bottom: 24,
-    left: 24,
-    right: 24,
-    backgroundColor: '#3b82f6',
-    paddingVertical: 16,
-    borderRadius: 12,
+    bottom: T.spacing.lg,
+    left: T.spacing.md,
+    right: T.spacing.md,
+    backgroundColor: T.colors.primary,
+    paddingVertical: T.spacing.md,
+    borderRadius: T.radius.lg,
     alignItems: 'center',
-    shadowColor: '#3b82f6',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 5,
+    ...T.shadow.md,
+    shadowColor: T.colors.primary,
   },
-  fabText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: 'bold',
-  }
+  fabText: { color: '#fff', fontSize: T.fontSize.base, fontWeight: '800', letterSpacing: 0.3 },
 });

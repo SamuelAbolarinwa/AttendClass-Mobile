@@ -64,3 +64,9 @@ jobs:
         with:
           name: app-release-${{ github.sha }}
           path: android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Upload Sourcemap
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-sourcemap-${{ github.sha }}
+          path: android/app/build/generated/sourcemaps/react/release/index.android.bundle.map

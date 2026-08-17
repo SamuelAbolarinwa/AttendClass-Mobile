@@ -68,7 +68,7 @@ export default function LoginScreen() {
               autoCorrect={false}
               returnKeyType="next"
               // ── Fix: explicit color ensures text is visible on any background ──
-              color={T.colors.inputText}
+              
             />
           </View>
 
@@ -83,7 +83,7 @@ export default function LoginScreen() {
               secureTextEntry
               returnKeyType="done"
               onSubmitEditing={handleLogin}
-              color={T.colors.inputText}
+              
             />
           </View>
 

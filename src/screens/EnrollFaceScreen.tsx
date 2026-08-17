@@ -24,7 +24,7 @@ export default function EnrollFaceScreen() {
   const [prompt, setPrompt] = useState('Look straight ahead');
   const [enrolling, setEnrolling] = useState(false);
 
-  const tfliteModel = useTensorflowModel(require('../../android/app/src/main/assets/mobilefacenet.tflite'));
+  const tfliteModel = useTensorflowModel(require('../../android/app/src/main/assets/mobilefacenet.tflite'), ['default']);
 
   useEffect(() => {
     (async () => {
@@ -65,7 +65,7 @@ export default function EnrollFaceScreen() {
     }
   }, [account, setHasMobileEnrollment]);
 
-  const { frameProcessor } = useFaceProcessor({
+  const { frameOutput } = useFaceProcessor({
     onLivenessChange: handleLivenessStateChange,
     onFaceEmbedding: handleFaceEnrolled,
     tfliteModel,
@@ -103,9 +103,8 @@ export default function EnrollFaceScreen() {
       <Camera
         style={StyleSheet.absoluteFill}
         device={device}
-        pixelFormat="rgb"
         isActive={!enrolling && uiLivenessState !== 'DONE'}
-        frameProcessor={frameProcessor}
+        outputs={[frameOutput]}
       />
 
       {/* Top header */}

@@ -75,7 +75,7 @@ export default function ResetPasswordScreen() {
                 value={value}
                 onChangeText={setter}
                 secureTextEntry
-                color={T.colors.inputText}
+                
               />
             </View>
           ))}

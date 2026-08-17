@@ -1,7 +1,7 @@
 import { useMemo, useRef } from 'react';
 import { useSharedValue } from 'react-native-worklets-core';
 import { Worklets } from 'react-native-worklets-core';
-import { useFrameProcessor } from 'react-native-vision-camera';
+import { useFrameOutput } from 'react-native-vision-camera';
 import { useFaceDetector } from 'react-native-vision-camera-face-detector';
 import { Images } from 'react-native-nitro-image';
 
@@ -74,10 +74,13 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteMode
   const tfliteRef = useRef(tfliteModel);
   tfliteRef.current = tfliteModel;
 
-  const frameProcessor = useFrameProcessor((frame) => {
-    'worklet';
+  const frameOutput = useFrameOutput({
+    pixelFormat: 'rgb',
+    onFrame: (frame) => {
+      'worklet';
 
-    if (livenessState.value === 'DONE') return;
+      try {
+        if (livenessState.value === 'DONE') return;
 
     const faces = faceDetectorRef.current.detectFaces(frame);
     if (faces.length === 0) {
@@ -117,7 +120,7 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteMode
         livenessState.value = 'DONE'; // Prevent multiple captures
 
         // 1. Convert Frame to ArrayBuffer
-        const buffer = frame.toArrayBuffer();
+        const buffer = frame.getPixelBuffer();
 
         // Map Vision-Camera v4 pixel format strings to Nitro-Image formats.
         // When Camera prop pixelFormat="rgb", Android delivers 'rgb-bgra-8-bit'.
@@ -199,9 +202,11 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteMode
         jsHandleLiveness('WAITING', `Error: ${e.message ?? 'Unknown'}. Tap retry.`);
       }
     }
-  // Stable deps only — no tfliteModel object, no detector object
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [livenessState, jsHandleLiveness, jsHandleFaceEnrolled, jsHandleSanityCheck]);
+      } finally {
+        frame.dispose();
+      }
+    }
+  });
 
-  return { frameProcessor, livenessState };
+  return { frameOutput, livenessState };
 }

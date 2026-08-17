@@ -131,7 +131,7 @@ export default function SettingsScreen({ navigation }: any) {
                 value={value}
                 onChangeText={setter}
                 // ── Fix: explicit text color prevents invisible text ──
-                color={T.colors.inputText}
+                
               />
             </View>
           ))}

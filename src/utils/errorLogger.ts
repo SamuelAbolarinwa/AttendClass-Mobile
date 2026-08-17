@@ -76,8 +76,8 @@ export function installGlobalErrorHandlers(
   onError?: (entry: CrashEntry) => void,
 ): void {
   // ── Uncaught JS errors (ErrorUtils is React Native's global error handler) ──
-  const previousHandler = (global as any).ErrorUtils?.getGlobalHandler?.();
-  (global as any).ErrorUtils?.setGlobalHandler?.((error: any, isFatal: boolean) => {
+  const previousHandler = (globalThis as any).ErrorUtils?.getGlobalHandler?.();
+  (globalThis as any).ErrorUtils?.setGlobalHandler?.((error: any, isFatal: boolean) => {
     const entry: CrashEntry = {
       ts: new Date().toISOString(),
       type: 'uncaught',
@@ -90,8 +90,8 @@ export function installGlobalErrorHandlers(
   });
 
   // ── Unhandled promise rejections ─────────────────────────────────────────────
-  const originalUnhandledRejection = (global as any).onunhandledrejection;
-  (global as any).onunhandledrejection = (event: any) => {
+  const originalUnhandledRejection = (globalThis as any).onunhandledrejection;
+  (globalThis as any).onunhandledrejection = (event: any) => {
     const reason = event?.reason;
     const entry: CrashEntry = {
       ts: new Date().toISOString(),

@@ -35,6 +35,17 @@ jobs:
           echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > .env
           echo "SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> .env
 
+      - name: Verify Environment Variables
+        run: |
+          URL_VAL=$(grep SUPABASE_URL .env | cut -d '=' -f2)
+          KEY_VAL=$(grep SUPABASE_ANON_KEY .env | cut -d '=' -f2)
+          echo "URL length: ${#URL_VAL} chars"
+          echo "KEY length: ${#KEY_VAL} chars"
+          if [ ${#URL_VAL} -eq 0 ]; then
+            echo "::error::SUPABASE_URL is empty in .env"
+            exit 1
+          fi
+
       - name: Install npm dependencies
         run: npm install
 

@@ -1,6 +1,6 @@
 import { useMemo, useRef } from 'react';
-import { useSharedValue } from 'react-native-worklets-core';
-import { Worklets } from 'react-native-worklets-core';
+import { useSharedValue } from 'react-native-reanimated';
+import { runOnJS } from 'react-native-worklets';
 import { useFrameOutput } from 'react-native-vision-camera';
 import { useFaceDetector } from 'react-native-vision-camera-face-detector';
 import { Images } from 'react-native-nitro-image';
@@ -27,19 +27,19 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteMode
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const jsHandleLiveness = useMemo(
-    () => Worklets.createRunOnJS((state: LivenessState, prompt: string) => onLivenessRef.current(state, prompt)),
+    () => runOnJS((state: LivenessState, prompt: string) => onLivenessRef.current(state, prompt)),
     [], // Created once, never recreated
   );
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const jsHandleFaceEnrolled = useMemo(
-    () => Worklets.createRunOnJS((embedding: number[]) => onEmbeddingRef.current(embedding)),
+    () => runOnJS((embedding: number[]) => onEmbeddingRef.current(embedding)),
     [],
   );
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const jsHandleSanityCheck = useMemo(
-    () => Worklets.createRunOnJS((imageObj: any) => {
+    () => runOnJS((imageObj: any) => {
       if (imageObj && imageObj.saveToTemporaryFileAsync) {
         imageObj.saveToTemporaryFileAsync('jpg', 90)
           .then((path: string) => {

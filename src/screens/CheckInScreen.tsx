@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Alert, StatusBar } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Camera, useCameraDevice } from 'react-native-vision-camera';
+import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { useTensorflowModel } from 'react-native-fast-tflite';
 import { BleManager, Device } from 'react-native-ble-plx';
 import { Buffer } from 'buffer';
@@ -16,7 +16,7 @@ type FlowStep = 'IDLE' | 'VERIFY_FACE' | 'CONNECT_BLE' | 'SUCCESS' | 'ALREADY_LO
 export default function CheckInScreen({ navigation }: any) {
   const { account } = useAuth();
   const device = useCameraDevice('front');
-  const [hasPermission, setHasPermission] = useState(false);
+  const { requestPermission, hasPermission } = useCameraPermission();
   
   const [step, setStep] = useState<FlowStep>('VERIFY_FACE');
   const [uiLivenessState, setUiLivenessState] = useState<LivenessState>('WAITING');
@@ -27,12 +27,11 @@ export default function CheckInScreen({ navigation }: any) {
   const bleManagerRef = useRef<BleManager | null>(null);
 
   // Load TFLite model
-  const tfliteModel = useTensorflowModel(require('../../android/app/src/main/assets/mobilefacenet.tflite'));
+  const tfliteModel = useTensorflowModel(require('../../android/app/src/main/assets/mobilefacenet.tflite'), []);
 
   useEffect(() => {
     (async () => {
-      const status = await Camera.requestCameraPermission();
-      setHasPermission(status === 'granted');
+      await requestPermission();
     })();
     
     bleManagerRef.current = new BleManager();
@@ -71,7 +70,7 @@ export default function CheckInScreen({ navigation }: any) {
     }
   }, [account]);
 
-  const { frameProcessor } = useFaceProcessor({
+  const { frameOutput } = useFaceProcessor({
     onLivenessChange: handleLivenessStateChange,
     onFaceEmbedding: handleFaceMatch,
     tfliteModel,
@@ -195,9 +194,8 @@ export default function CheckInScreen({ navigation }: any) {
           <Camera
             style={StyleSheet.absoluteFill}
             device={device}
-            pixelFormat="rgb"
             isActive={uiLivenessState !== 'DONE'}
-            frameProcessor={frameProcessor}
+            outputs={[frameOutput]}
           />
         ) : (
           <Text style={{color: 'white'}}>No camera available.</Text>

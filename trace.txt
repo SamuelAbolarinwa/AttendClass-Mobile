@@ -1,0 +1,3 @@
+TypeError: undefined is not a function
+    at useFaceProcessor (index.android.bundle:1:606183)
+    at EnrollFaceScreen (index.android.bundle:1:585609)

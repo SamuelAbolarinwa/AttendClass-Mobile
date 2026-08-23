@@ -9,7 +9,7 @@ import {
   StatusBar,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Camera, useCameraDevice } from 'react-native-vision-camera';
+import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { useTensorflowModel } from 'react-native-fast-tflite';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
@@ -19,17 +19,16 @@ import { T } from '../theme/tokens';
 export default function EnrollFaceScreen() {
   const { account, setHasMobileEnrollment } = useAuth();
   const device = useCameraDevice('front');
-  const [hasPermission, setHasPermission] = useState(false);
   const [uiLivenessState, setUiLivenessState] = useState<LivenessState>('WAITING');
   const [prompt, setPrompt] = useState('Look straight ahead');
   const [enrolling, setEnrolling] = useState(false);
 
-  const tfliteModel = useTensorflowModel(require('../../android/app/src/main/assets/mobilefacenet.tflite'), ['default']);
+  const { requestPermission, hasPermission } = useCameraPermission();
+  const tfliteModel = useTensorflowModel(require('../../android/app/src/main/assets/mobilefacenet.tflite'), []);
 
   useEffect(() => {
     (async () => {
-      const status = await Camera.requestCameraPermission();
-      setHasPermission(status === 'granted');
+      await requestPermission();
     })();
   }, []);
 

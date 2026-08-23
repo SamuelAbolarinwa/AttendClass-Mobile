@@ -73,7 +73,7 @@ export function AttendanceHeatmap({ logs, trackingStartDate, endDate, cancelledD
                   const isWeekend = dObj.getDay() === 0 || dObj.getDay() === 6;
                   const isFuture = dateStr > todayStr;
 
-                  let color = T.colors.bg;
+                  let color: string = T.colors.bg;
                   let status = "Not yet tracked";
                   let isDashed = false;
 

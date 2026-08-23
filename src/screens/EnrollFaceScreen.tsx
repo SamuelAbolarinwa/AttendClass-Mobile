@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -16,6 +16,8 @@ import { supabase } from '../lib/supabase';
 import { useFaceProcessor, LivenessState } from '../hooks/useFaceProcessor';
 import { T } from '../theme/tokens';
 
+type InitState = 'REQUESTING_PERMISSION' | 'WAITING_FOR_CAMERA' | 'LOADING_TFLITE_MODEL' | 'LOOKING_FOR_FACE' | 'ERROR';
+
 export default function EnrollFaceScreen() {
   const { account, setHasMobileEnrollment } = useAuth();
   const device = useCameraDevice('front');
@@ -23,14 +25,71 @@ export default function EnrollFaceScreen() {
   const [prompt, setPrompt] = useState('Look straight ahead');
   const [enrolling, setEnrolling] = useState(false);
 
+  const [initState, setInitState] = useState<InitState>('REQUESTING_PERMISSION');
+  const [initError, setInitError] = useState<string | null>(null);
+  const [frameCount, setFrameCount] = useState(0);
+
   const { requestPermission, hasPermission } = useCameraPermission();
   const tfliteModel = useTensorflowModel(require('../../android/app/src/main/assets/mobilefacenet.tflite'), []);
 
   useEffect(() => {
-    (async () => {
-      await requestPermission();
-    })();
-  }, []);
+    let timeout: ReturnType<typeof setTimeout>;
+    if (initState === 'REQUESTING_PERMISSION') {
+      if (hasPermission) {
+        setInitState('WAITING_FOR_CAMERA');
+        return;
+      }
+      timeout = setTimeout(() => {
+        setInitState('ERROR');
+        setInitError('Timed out requesting camera permission.');
+      }, 10000);
+      requestPermission().then(status => {
+        if (!status) {
+          setInitState('ERROR');
+          setInitError('Camera permission denied.');
+        } else {
+          setInitState('WAITING_FOR_CAMERA');
+        }
+      }).catch(e => {
+        setInitState('ERROR');
+        setInitError(e.message);
+      });
+      return () => clearTimeout(timeout);
+    }
+  }, [initState, requestPermission, hasPermission]);
+
+  useEffect(() => {
+    let timeout: ReturnType<typeof setTimeout>;
+    if (initState === 'WAITING_FOR_CAMERA') {
+      timeout = setTimeout(() => {
+        setInitState('ERROR');
+        setInitError('Timed out waiting for camera to initialize.');
+      }, 10000);
+      if (device) {
+        setInitState('LOADING_TFLITE_MODEL');
+      }
+      return () => clearTimeout(timeout);
+    }
+  }, [initState, device]);
+
+  useEffect(() => {
+    let timeout: ReturnType<typeof setTimeout>;
+    if (initState === 'LOADING_TFLITE_MODEL') {
+      timeout = setTimeout(() => {
+        setInitState('ERROR');
+        setInitError('Timed out loading TFLite model.');
+      }, 10000);
+      
+      if (tfliteModel.state === 'loaded' && tfliteModel.model) {
+        setInitState('LOOKING_FOR_FACE');
+      } else if (tfliteModel.state === 'error') {
+        setInitState('ERROR');
+        // @ts-ignore
+        setInitError(tfliteModel.error?.message || 'Failed to load model.');
+      }
+      return () => clearTimeout(timeout);
+    }
+  }, [initState, tfliteModel.state, tfliteModel.model, (tfliteModel as any).error]);
 
   const handleLivenessStateChange = useCallback((newState: LivenessState, newPrompt: string) => {
     setUiLivenessState(newState);
@@ -64,9 +123,19 @@ export default function EnrollFaceScreen() {
     }
   }, [account, setHasMobileEnrollment]);
 
+  const lastTickRef = useRef(0);
+  const handleFrameTick = useCallback(() => {
+    const now = Date.now();
+    if (now - lastTickRef.current > 500) {
+      setFrameCount(prev => prev + 1);
+      lastTickRef.current = now;
+    }
+  }, []);
+
   const { frameOutput } = useFaceProcessor({
     onLivenessChange: handleLivenessStateChange,
     onFaceEmbedding: handleFaceEnrolled,
+    onFrameTick: handleFrameTick,
     tfliteModel,
   });
 
@@ -74,24 +143,24 @@ export default function EnrollFaceScreen() {
   const steps: LivenessState[] = ['WAITING', 'BLINK', 'TURN_LEFT', 'TURN_RIGHT', 'CAPTURING'];
   const stepIdx = steps.indexOf(uiLivenessState);
 
-  if (!hasPermission) {
+  if (initState === 'ERROR') {
     return (
       <SafeAreaView style={styles.center}>
-        <Text style={styles.permissionIcon}>📷</Text>
-        <Text style={styles.permissionTitle}>Camera Permission Required</Text>
-        <Text style={styles.permissionText}>
-          Please grant camera access in Settings to enroll your face.
-        </Text>
+        <Text style={styles.permissionIcon}>❌</Text>
+        <Text style={styles.permissionTitle}>Initialization Failed</Text>
+        <Text style={styles.permissionText}>{initError}</Text>
+        <TouchableOpacity style={styles.devBypassBtn} onPress={() => { setInitState('REQUESTING_PERMISSION'); setInitError(null); }}>
+          <Text style={styles.devBypassText}>Retry</Text>
+        </TouchableOpacity>
       </SafeAreaView>
     );
   }
 
-  if (!device) {
+  if (initState !== 'LOOKING_FOR_FACE') {
     return (
       <SafeAreaView style={styles.center}>
-        <Text style={styles.permissionIcon}>🔍</Text>
-        <Text style={styles.permissionTitle}>No Front Camera</Text>
-        <Text style={styles.permissionText}>A front-facing camera is required.</Text>
+        <ActivityIndicator size="large" color={T.colors.primary} />
+        <Text style={[styles.permissionTitle, { marginTop: 20 }]}>{initState.replace(/_/g, ' ')}</Text>
       </SafeAreaView>
     );
   }
@@ -99,17 +168,18 @@ export default function EnrollFaceScreen() {
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="black" />
-      <Camera
-        style={StyleSheet.absoluteFill}
-        device={device}
-        isActive={!enrolling && uiLivenessState !== 'DONE'}
-        outputs={[frameOutput]}
-      />
+      {device && (
+        <Camera
+          style={StyleSheet.absoluteFill}
+          device={device}
+          isActive={!enrolling && uiLivenessState !== 'DONE'}
+          outputs={[frameOutput]}
+        />
+      )}
 
-      {/* Top header */}
       <SafeAreaView edges={['top']} style={styles.topHeader}>
         <Text style={styles.headerTitle}>Face Enrollment</Text>
-        <Text style={styles.headerSub}>Step {Math.max(1, stepIdx + 1)} of {steps.length}</Text>
+        <Text style={styles.headerSub}>Step {Math.max(1, stepIdx + 1)} of {steps.length} | Frames: {frameCount}</Text>
       </SafeAreaView>
 
       {/* Bottom card */}

@@ -30,13 +30,12 @@ export default function AppNavigator() {
         <Stack.Screen name="Login" component={LoginScreen} />
       ) : account.must_change_password ? (
         <Stack.Screen name="ResetPassword" component={ResetPasswordScreen} />
-      ) : !hasMobileEnrollment ? (
-        <Stack.Screen name="EnrollFace" component={EnrollFaceScreen} />
       ) : (
         <Stack.Group>
           <Stack.Screen name="Dashboard" component={DashboardScreen} />
           <Stack.Screen name="Settings" component={SettingsScreen} />
           <Stack.Screen name="CheckIn" component={CheckInScreen} />
+          <Stack.Screen name="EnrollFace" component={EnrollFaceScreen} />
         </Stack.Group>
       )}
     </Stack.Navigator>

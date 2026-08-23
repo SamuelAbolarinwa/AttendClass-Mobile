@@ -14,7 +14,7 @@ import { T } from '../theme/tokens';
 type FlowStep = 'IDLE' | 'VERIFY_FACE' | 'CONNECT_BLE' | 'SUCCESS' | 'ALREADY_LOGGED' | 'FAILED';
 
 export default function CheckInScreen({ navigation }: any) {
-  const { account } = useAuth();
+  const { account, hasMobileEnrollment } = useAuth();
   const device = useCameraDevice('front');
   const { requestPermission, hasPermission } = useCameraPermission();
   
@@ -170,6 +170,25 @@ export default function CheckInScreen({ navigation }: any) {
   // ── Step indicator for face capture ─────────────────────────────────────
   const steps: LivenessState[] = ['WAITING', 'BLINK', 'TURN_LEFT', 'TURN_RIGHT', 'CAPTURING'];
   const stepIdx = steps.indexOf(uiLivenessState);
+
+  if (!hasMobileEnrollment) {
+    return (
+      <SafeAreaView style={styles.center} edges={['top', 'bottom']}>
+        <StatusBar barStyle="dark-content" backgroundColor={T.colors.bg} />
+        <View style={styles.messageCard}>
+          <Text style={styles.emoji}>👤</Text>
+          <Text style={styles.cardTitle}>Face ID Required</Text>
+          <Text style={styles.cardText}>You need to set up Face ID before you can check in to a class.</Text>
+          <TouchableOpacity style={styles.primaryBtn} onPress={() => navigation.replace('EnrollFace')}>
+            <Text style={styles.primaryBtnText}>Set Up Face ID</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.outlineBtn} onPress={() => navigation.goBack()}>
+            <Text style={styles.outlineBtnText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   if (!hasPermission) {
     return (

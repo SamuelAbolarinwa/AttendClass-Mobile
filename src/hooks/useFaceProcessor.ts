@@ -10,10 +10,11 @@ export type LivenessState = 'WAITING' | 'BLINK' | 'TURN_LEFT' | 'TURN_RIGHT' | '
 interface UseFaceProcessorOptions {
   onLivenessChange: (state: LivenessState, prompt: string) => void;
   onFaceEmbedding: (embedding: number[]) => void;
+  onFrameTick?: () => void;
   tfliteModel: any;
 }
 
-export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteModel }: UseFaceProcessorOptions) {
+export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, onFrameTick, tfliteModel }: UseFaceProcessorOptions) {
   const livenessState = useSharedValue<LivenessState>('WAITING');
 
   // ── CRITICAL FIX 1: Stabilise Worklets.createRunOnJS handles ──────────────
@@ -24,6 +25,8 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteMode
   onLivenessRef.current = onLivenessChange;
   const onEmbeddingRef = useRef(onFaceEmbedding);
   onEmbeddingRef.current = onFaceEmbedding;
+  const onFrameTickRef = useRef(onFrameTick);
+  onFrameTickRef.current = onFrameTick;
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const jsHandleLiveness = useMemo(
@@ -34,6 +37,14 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteMode
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const jsHandleFaceEnrolled = useMemo(
     () => runOnJS((embedding: number[]) => onEmbeddingRef.current(embedding)),
+    [],
+  );
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const jsHandleFrameTick = useMemo(
+    () => runOnJS(() => {
+      if (onFrameTickRef.current) onFrameTickRef.current();
+    }),
     [],
   );
 
@@ -80,6 +91,7 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteMode
       'worklet';
 
       try {
+        jsHandleFrameTick();
         if (livenessState.value === 'DONE') return;
 
     const faces = faceDetectorRef.current.detectFaces(frame);
@@ -111,8 +123,8 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, tfliteMode
       }
     } else if (livenessState.value === 'CAPTURING') {
       if (!tfliteRef.current?.model) {
-        livenessState.value = 'DONE';
-        jsHandleLiveness('DONE', 'Model not ready');
+        livenessState.value = 'WAITING';
+        jsHandleLiveness('WAITING', 'Error: TFLite model is not loaded yet.');
         return;
       }
 

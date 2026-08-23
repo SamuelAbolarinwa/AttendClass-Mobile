@@ -17,7 +17,8 @@ import { AttendanceHeatmap } from '../components/AttendanceHeatmap';
 import { T } from '../theme/tokens';
 
 export default function DashboardScreen({ navigation }: any) {
-  const { account } = useAuth();
+  const { account, hasMobileEnrollment } = useAuth();
+  const [dismissBanner, setDismissBanner] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [logs, setLogs] = useState<any[]>([]);
@@ -120,6 +121,23 @@ export default function DashboardScreen({ navigation }: any) {
         {error && (
           <View style={styles.errorBox}>
             <Text style={styles.errorText}>⚠️ {error}</Text>
+          </View>
+        )}
+
+        {!hasMobileEnrollment && !dismissBanner && !loading && (
+          <View style={styles.enrollBanner}>
+            <View style={styles.enrollBannerContent}>
+              <Text style={styles.enrollBannerTitle}>Set up Face ID</Text>
+              <Text style={styles.enrollBannerText}>Register your face for quick check-in.</Text>
+            </View>
+            <View style={styles.enrollBannerActions}>
+              <TouchableOpacity onPress={() => navigation.navigate('EnrollFace')} style={styles.enrollBannerBtn}>
+                <Text style={styles.enrollBannerBtnText}>Setup</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setDismissBanner(true)} style={styles.enrollBannerDismiss}>
+                <Text style={styles.enrollBannerDismissText}>Later</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )}
 
@@ -235,6 +253,25 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     ...T.shadow.sm,
   },
+  enrollBanner: {
+    backgroundColor: '#fffbeb',
+    borderColor: '#fde68a',
+    borderWidth: 1,
+    borderRadius: T.radius.md,
+    padding: T.spacing.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: T.spacing.sm,
+  },
+  enrollBannerContent: { flex: 1 },
+  enrollBannerTitle: { fontSize: T.fontSize.sm, fontWeight: '700', color: '#92400e' },
+  enrollBannerText: { fontSize: T.fontSize.xs, color: '#b45309', marginTop: 2 },
+  enrollBannerActions: { flexDirection: 'row', gap: 8 },
+  enrollBannerBtn: { backgroundColor: '#d97706', paddingHorizontal: 12, paddingVertical: 6, borderRadius: T.radius.sm },
+  enrollBannerBtnText: { color: '#fff', fontSize: T.fontSize.xs, fontWeight: '600' },
+  enrollBannerDismiss: { paddingHorizontal: 8, paddingVertical: 6 },
+  enrollBannerDismissText: { color: '#b45309', fontSize: T.fontSize.xs, fontWeight: '600' },
   statValue: { fontSize: 28, fontWeight: '800' },
   statLabel: { fontSize: T.fontSize.xs, fontWeight: '600', color: T.colors.textMuted, marginTop: 4, textTransform: 'uppercase', letterSpacing: 0.5 },
   card: {

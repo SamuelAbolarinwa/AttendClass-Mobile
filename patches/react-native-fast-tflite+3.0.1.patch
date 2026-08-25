@@ -1,0 +1,33 @@
+diff --git a/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt b/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
+index c2360f5..4c0e8bf 100644
+--- a/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
++++ b/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
+@@ -5,14 +5,26 @@ import com.facebook.proguard.annotations.DoNotStrip
+ import com.margelo.nitro.core.ArrayBuffer
+ import com.margelo.nitro.core.Promise
+ import java.net.URL
++import com.margelo.nitro.NitroModules
+ 
+ @Keep
+ @DoNotStrip
+ class HybridAssetLoader : HybridAssetLoaderSpec() {
+   override fun loadAsset(path: String): Promise<ArrayBuffer> {
+     return Promise.async {
+-      val bytes = URL(path).readBytes()
+-      return@async ArrayBuffer.copy(bytes)
++      if (path.startsWith("http://") || path.startsWith("https://") || path.startsWith("file://")) {
++        val bytes = URL(path).readBytes()
++        return@async ArrayBuffer.copy(bytes)
++      } else {
++        val context = NitroModules.applicationContext
++        // Metro places bundled assets in res/raw with mangled names
++        val resId = context.resources.getIdentifier(path, "raw", context.packageName)
++        if (resId == 0) {
++            throw Exception("Asset not found: $path")
++        }
++        val bytes = context.resources.openRawResource(resId).readBytes()
++        return@async ArrayBuffer.copy(bytes)
++      }
+     }
+   }
+ }

@@ -1,5 +1,5 @@
 diff --git a/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt b/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
-index c2360f5..4c0e8bf 100644
+index c2360f5..2837132 100644
 --- a/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
 +++ b/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
 @@ -5,14 +5,26 @@ import com.facebook.proguard.annotations.DoNotStrip
@@ -19,7 +19,7 @@ index c2360f5..4c0e8bf 100644
 +        val bytes = URL(path).readBytes()
 +        return@async ArrayBuffer.copy(bytes)
 +      } else {
-+        val context = NitroModules.applicationContext
++        val context = NitroModules.applicationContext ?: throw Exception("NitroModules.applicationContext is null")
 +        // Metro places bundled assets in res/raw with mangled names
 +        val resId = context.resources.getIdentifier(path, "raw", context.packageName)
 +        if (resId == 0) {

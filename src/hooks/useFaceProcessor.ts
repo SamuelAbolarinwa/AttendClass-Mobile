@@ -11,11 +11,14 @@ interface UseFaceProcessorOptions {
   onLivenessChange: (state: LivenessState, prompt: string) => void;
   onFaceEmbedding: (embedding: number[]) => void;
   onFrameTick?: () => void;
+  onDebugChange?: (debugData: any) => void;
+  onError?: (error: string) => void;
   tfliteModel: any;
 }
 
-export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, onFrameTick, tfliteModel }: UseFaceProcessorOptions) {
+export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, onFrameTick, onDebugChange, onError, tfliteModel }: UseFaceProcessorOptions) {
   const livenessState = useSharedValue<LivenessState>('WAITING');
+  const frameCount = useSharedValue(0);
 
   // ── CRITICAL FIX 1: Stabilise Worklets.createRunOnJS handles ──────────────
   // These must NOT be recreated on every render — they hold native worklet state.
@@ -27,6 +30,10 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, onFrameTic
   onEmbeddingRef.current = onFaceEmbedding;
   const onFrameTickRef = useRef(onFrameTick);
   onFrameTickRef.current = onFrameTick;
+  const onDebugRef = useRef(onDebugChange);
+  onDebugRef.current = onDebugChange;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const jsHandleLiveness = useMemo(
@@ -44,6 +51,22 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, onFrameTic
   const jsHandleFrameTick = useMemo(
     () => runOnJS(() => {
       if (onFrameTickRef.current) onFrameTickRef.current();
+    }),
+    [],
+  );
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const jsHandleDebug = useMemo(
+    () => runOnJS((debugData: any) => {
+      if (onDebugRef.current) onDebugRef.current(debugData);
+    }),
+    [],
+  );
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const jsHandleError = useMemo(
+    () => runOnJS((err: string) => {
+      if (onErrorRef.current) onErrorRef.current(err);
     }),
     [],
   );
@@ -91,10 +114,21 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, onFrameTic
       'worklet';
 
       try {
+        frameCount.value = frameCount.value + 1;
         jsHandleFrameTick();
         if (livenessState.value === 'DONE') return;
 
     const faces = faceDetectorRef.current.detectFaces(frame);
+    
+    jsHandleDebug({
+        frameCount: frameCount.value,
+        pixelFormat: frame.pixelFormat,
+        width: frame.width,
+        height: frame.height,
+        facesDetected: faces.length,
+        isDone: livenessState.value === 'DONE'
+    });
+
     if (faces.length === 0) {
       if (livenessState.value !== 'WAITING') {
         livenessState.value = 'WAITING';
@@ -214,6 +248,8 @@ export function useFaceProcessor({ onLivenessChange, onFaceEmbedding, onFrameTic
         jsHandleLiveness('WAITING', `Error: ${e.message ?? 'Unknown'}. Tap retry.`);
       }
     }
+      } catch (globalError: any) {
+        jsHandleError(globalError.message || String(globalError));
       } finally {
         frame.dispose();
       }

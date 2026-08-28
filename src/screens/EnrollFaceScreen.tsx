@@ -24,6 +24,8 @@ export default function EnrollFaceScreen() {
   const [uiLivenessState, setUiLivenessState] = useState<LivenessState>('WAITING');
   const [prompt, setPrompt] = useState('Look straight ahead');
   const [enrolling, setEnrolling] = useState(false);
+  const [debugData, setDebugData] = useState<any>(null);
+  const [workletError, setWorkletError] = useState<string | null>(null);
 
   const [initState, setInitState] = useState<InitState>('REQUESTING_PERMISSION');
   const [initError, setInitError] = useState<string | null>(null);
@@ -136,6 +138,8 @@ export default function EnrollFaceScreen() {
     onLivenessChange: handleLivenessStateChange,
     onFaceEmbedding: handleFaceEnrolled,
     onFrameTick: handleFrameTick,
+    onDebugChange: setDebugData,
+    onError: setWorkletError,
     tfliteModel,
   });
 
@@ -175,6 +179,16 @@ export default function EnrollFaceScreen() {
           isActive={!enrolling && uiLivenessState !== 'DONE'}
           outputs={[frameOutput]}
         />
+      )}
+
+      {__DEV__ && (
+        <View style={styles.debugOverlay}>
+          <Text style={styles.debugText}>Error: {workletError || 'None'}</Text>
+          <Text style={styles.debugText}>Cam: {device?.name} (Perm: {String(hasPermission)})</Text>
+          <Text style={styles.debugText}>Frame: {debugData?.frameCount || 0}</Text>
+          <Text style={styles.debugText}>Fmt: {debugData?.pixelFormat} {debugData?.width}x{debugData?.height}</Text>
+          <Text style={styles.debugText}>Faces: {debugData?.facesDetected || 0}</Text>
+        </View>
       )}
 
       <SafeAreaView edges={['top']} style={styles.topHeader}>
@@ -322,5 +336,20 @@ const styles = StyleSheet.create({
     color: T.colors.warning,
     fontSize: T.fontSize.sm,
     fontWeight: '600',
+  },
+  debugOverlay: {
+    position: 'absolute',
+    top: 90,
+    left: 20,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    padding: 10,
+    borderRadius: 8,
+    zIndex: 100,
+  },
+  debugText: {
+    color: '#0f0',
+    fontFamily: 'monospace',
+    fontSize: 10,
+    lineHeight: 14,
   },
 });

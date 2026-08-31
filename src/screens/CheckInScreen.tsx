@@ -3,12 +3,13 @@ import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Alert, Sta
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { useTensorflowModel } from 'react-native-fast-tflite';
+import { useImageFaceDetector } from 'react-native-vision-camera-face-detector';
+import { Images } from 'react-native-nitro-image';
 import { BleManager, Device } from 'react-native-ble-plx';
 import { Buffer } from 'buffer';
 
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
-import { useFaceProcessor, LivenessState } from '../hooks/useFaceProcessor';
 import { T } from '../theme/tokens';
 
 type FlowStep = 'IDLE' | 'VERIFY_FACE' | 'CONNECT_BLE' | 'SUCCESS' | 'ALREADY_LOGGED' | 'FAILED';
@@ -17,10 +18,17 @@ export default function CheckInScreen({ navigation }: any) {
   const { account, hasMobileEnrollment } = useAuth();
   const device = useCameraDevice('front');
   const { requestPermission, hasPermission } = useCameraPermission();
+  const cameraRef = useRef<any>(null);
+  const faceDetector = useImageFaceDetector({
+    performanceMode: 'accurate',
+    runLandmarks: false,
+    runContours: false,
+    runClassifications: false,
+  });
   
   const [step, setStep] = useState<FlowStep>('VERIFY_FACE');
-  const [uiLivenessState, setUiLivenessState] = useState<LivenessState>('WAITING');
-  const [prompt, setPrompt] = useState('Look straight ahead');
+  const [prompt, setPrompt] = useState('Position your face in the frame');
+  const [isCapturing, setIsCapturing] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [faceSimilarity, setFaceSimilarity] = useState<number | null>(null);
   
@@ -40,13 +48,7 @@ export default function CheckInScreen({ navigation }: any) {
     };
   }, []);
 
-  const handleLivenessStateChange = useCallback((newState: LivenessState, newPrompt: string) => {
-    setUiLivenessState(newState);
-    setPrompt(newPrompt);
-  }, []);
-
   const handleFaceMatch = useCallback(async (embedding: number[]) => {
-    setUiLivenessState('DONE');
     try {
       const { data, error } = await supabase.rpc('platform_verify_face', {
         p_token: account?.token,
@@ -70,11 +72,78 @@ export default function CheckInScreen({ navigation }: any) {
     }
   }, [account]);
 
-  const { frameOutput } = useFaceProcessor({
-    onLivenessChange: handleLivenessStateChange,
-    onFaceEmbedding: handleFaceMatch,
-    tfliteModel,
-  });
+  const captureAndVerify = async () => {
+    if (!cameraRef.current) return;
+    if (!tfliteModel.model) {
+      setErrorMsg("Model not loaded yet.");
+      setStep('FAILED');
+      return;
+    }
+    
+    setIsCapturing(true);
+    setPrompt('Analyzing face...');
+    try {
+      const photo = await cameraRef.current.takePhoto({ qualityPrioritization: 'speed' });
+      const faces = faceDetector.detectFaces(photo.path);
+      
+      if (faces.length !== 1) {
+          throw new Error(`Expected exactly 1 face, found ${faces.length}. Please retry.`);
+      }
+      
+      const face = faces[0];
+      const image = await Images.loadFromFileAsync(photo.path);
+      
+      const startX = Math.max(0, face.bounds.x);
+      const startY = Math.max(0, face.bounds.y);
+      const endX = Math.min(image.width, face.bounds.x + face.bounds.width);
+      const endY = Math.min(image.height, face.bounds.y + face.bounds.height);
+      
+      const cropped = image.crop(startX, startY, endX, endY);
+      const resized = cropped.resize(112, 112);
+      
+      const outputData = resized.toRawPixelData();
+      const rgba = new Uint8Array(outputData.buffer);
+      const rgbFloat = new Float32Array(112 * 112 * 3);
+
+      const isBGRA = outputData.pixelFormat === 'BGRA' || (outputData.pixelFormat as any) === 'bgra';
+      const isARGB = outputData.pixelFormat === 'ARGB' || (outputData.pixelFormat as any) === 'argb';
+
+      let j = 0;
+      for (let i = 0; i < rgba.length; i += 4) {
+        let r: number, g: number, b: number;
+        if (isBGRA) {
+          b = rgba[i]; g = rgba[i + 1]; r = rgba[i + 2];
+        } else if (isARGB) {
+          r = rgba[i + 1]; g = rgba[i + 2]; b = rgba[i + 3];
+        } else {
+          r = rgba[i]; g = rgba[i + 1]; b = rgba[i + 2];
+        }
+        rgbFloat[j++] = ((r / 255.0) - 0.5) * 2.0;
+        rgbFloat[j++] = ((g / 255.0) - 0.5) * 2.0;
+        rgbFloat[j++] = ((b / 255.0) - 0.5) * 2.0;
+      }
+
+      const outputBuffers = tfliteModel.model.runSync([rgbFloat.buffer]);
+      const embeddingArray = Array.from(new Float32Array(outputBuffers[0]));
+      
+      await handleFaceMatch(embeddingArray);
+    } catch (e: any) {
+      setErrorMsg(e.message);
+      setStep('FAILED');
+    } finally {
+      setIsCapturing(false);
+    }
+  };
+
+  useEffect(() => {
+    let timeoutId: ReturnType<typeof setTimeout>;
+    if (step === 'VERIFY_FACE') {
+      timeoutId = setTimeout(() => {
+        captureAndVerify();
+      }, 2000);
+    }
+    return () => clearTimeout(timeoutId);
+  }, [step, tfliteModel.model]);
 
   const startBleScan = (similarity: number) => {
     if (!bleManagerRef.current) return;
@@ -163,13 +232,9 @@ export default function CheckInScreen({ navigation }: any) {
     setStep('VERIFY_FACE');
     setErrorMsg(null);
     setFaceSimilarity(null);
-    setUiLivenessState('WAITING');
-    setPrompt('Look straight ahead');
+    setPrompt('Position your face in the frame');
+    setIsCapturing(false);
   };
-
-  // ── Step indicator for face capture ─────────────────────────────────────
-  const steps: LivenessState[] = ['WAITING', 'BLINK', 'TURN_LEFT', 'TURN_RIGHT', 'CAPTURING'];
-  const stepIdx = steps.indexOf(uiLivenessState);
 
   if (!hasMobileEnrollment) {
     return (
@@ -211,10 +276,10 @@ export default function CheckInScreen({ navigation }: any) {
         <StatusBar barStyle="light-content" backgroundColor="black" />
         {device ? (
           <Camera
+            ref={cameraRef}
             style={StyleSheet.absoluteFill}
             device={device}
-            isActive={uiLivenessState !== 'DONE'}
-            outputs={[frameOutput]}
+            isActive={step === 'VERIFY_FACE'}
           />
         ) : (
           <Text style={{color: 'white'}}>No camera available.</Text>
@@ -227,26 +292,20 @@ export default function CheckInScreen({ navigation }: any) {
           </TouchableOpacity>
           <View style={{ alignItems: 'center' }}>
             <Text style={styles.headerTitleLight}>Face Verification</Text>
-            <Text style={styles.headerSubLight}>Step {Math.max(1, stepIdx + 1)} of {steps.length}</Text>
           </View>
           <View style={{ width: 44 }} /> 
         </SafeAreaView>
 
         {/* Bottom card */}
         <View style={styles.bottomCard}>
-          <View style={styles.dots}>
-            {steps.map((s, i) => (
-              <View key={s} style={[styles.dot, i <= stepIdx && styles.dotActive]} />
-            ))}
-          </View>
           <Text style={styles.prompt}>{prompt}</Text>
-          {uiLivenessState === 'DONE' && (
+          {isCapturing && (
             <View style={styles.enrollingRow}>
               <ActivityIndicator color={T.colors.primary} />
               <Text style={styles.enrollingText}>Verifying face...</Text>
             </View>
           )}
-          {__DEV__ && uiLivenessState !== 'DONE' && (
+          {__DEV__ && !isCapturing && (
             <TouchableOpacity
               style={styles.devBypassBtn}
               onPress={() => {

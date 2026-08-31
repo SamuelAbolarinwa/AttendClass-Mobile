@@ -11,9 +11,10 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { useTensorflowModel } from 'react-native-fast-tflite';
+import { useImageFaceDetector } from 'react-native-vision-camera-face-detector';
+import { Images } from 'react-native-nitro-image';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
-import { useFaceProcessor, LivenessState } from '../hooks/useFaceProcessor';
 import { T } from '../theme/tokens';
 
 type InitState = 'REQUESTING_PERMISSION' | 'WAITING_FOR_CAMERA' | 'LOADING_TFLITE_MODEL' | 'LOOKING_FOR_FACE' | 'ERROR';
@@ -21,15 +22,21 @@ type InitState = 'REQUESTING_PERMISSION' | 'WAITING_FOR_CAMERA' | 'LOADING_TFLIT
 export default function EnrollFaceScreen() {
   const { account, setHasMobileEnrollment } = useAuth();
   const device = useCameraDevice('front');
-  const [uiLivenessState, setUiLivenessState] = useState<LivenessState>('WAITING');
-  const [prompt, setPrompt] = useState('Look straight ahead');
-  const [enrolling, setEnrolling] = useState(false);
-  const [debugData, setDebugData] = useState<any>(null);
-  const [workletError, setWorkletError] = useState<string | null>(null);
+  const cameraRef = useRef<any>(null);
+  const faceDetector = useImageFaceDetector({
+    performanceMode: 'accurate',
+    runLandmarks: false,
+    runContours: false,
+    runClassifications: false,
+  });
 
   const [initState, setInitState] = useState<InitState>('REQUESTING_PERMISSION');
   const [initError, setInitError] = useState<string | null>(null);
-  const [frameCount, setFrameCount] = useState(0);
+  
+  const [enrolling, setEnrolling] = useState(false);
+  const [enrollError, setEnrollError] = useState<string | null>(null);
+  const [captureStep, setCaptureStep] = useState(0); // 0 = idle, 1..3 = capturing
+  const [prompt, setPrompt] = useState('Position your face in the frame');
 
   const { requestPermission, hasPermission } = useCameraPermission();
   const tfliteModel = useTensorflowModel(require('../../android/app/src/main/assets/mobilefacenet.tflite'), []);
@@ -93,59 +100,114 @@ export default function EnrollFaceScreen() {
     }
   }, [initState, tfliteModel.state, tfliteModel.model, (tfliteModel as any).error]);
 
-  const handleLivenessStateChange = useCallback((newState: LivenessState, newPrompt: string) => {
-    setUiLivenessState(newState);
-    setPrompt(newPrompt);
-  }, []);
-
-  const handleFaceEnrolled = useCallback(async (embedding: number[]) => {
-    setEnrolling(true);
-    setUiLivenessState('DONE');
+  const submitEmbeddings = async (embeddings: number[][]) => {
     try {
+      // Average the embeddings
+      const averaged = Array(192).fill(0);
+      for (let i = 0; i < 192; i++) {
+        let sum = 0;
+        for (let j = 0; j < embeddings.length; j++) {
+          sum += embeddings[j][i];
+        }
+        averaged[i] = sum / embeddings.length;
+      }
+
       const { data, error } = await supabase.rpc('platform_enroll_face', {
         p_token: account?.token,
-        p_embedding: JSON.stringify(embedding),
+        p_embedding: JSON.stringify(averaged),
         p_model_version: 'mobilefacenet-mobile-v1',
       });
       if (error || !(data as any).ok) {
-        Alert.alert('Enrollment Failed', error?.message || 'Could not save face data. Please try again.');
-        setUiLivenessState('WAITING');
-        setPrompt('Look straight ahead');
-      } else {
-        Alert.alert('Face Enrolled', 'Your face has been registered. You can now check in.', [
-          { text: 'Continue', onPress: () => setHasMobileEnrollment(true) },
-        ]);
+        throw new Error(error?.message || 'Could not save face data.');
       }
+      
+      Alert.alert('Face Enrolled', 'Your face has been registered. You can now check in.', [
+        { text: 'Continue', onPress: () => setHasMobileEnrollment(true) },
+      ]);
     } catch (e: any) {
-      Alert.alert('Error', e.message);
-      setUiLivenessState('WAITING');
-      setPrompt('Look straight ahead');
+      setEnrollError(e.message);
+      setCaptureStep(0);
+      setPrompt('Position your face in the frame');
+    }
+  };
+
+  const startCaptureSequence = async () => {
+    if (!cameraRef.current) return;
+    if (!tfliteModel.model) {
+      setEnrollError("Model not loaded yet.");
+      return;
+    }
+    
+    setEnrolling(true);
+    setEnrollError(null);
+    const embeddings: number[][] = [];
+    
+    try {
+      for (let step = 1; step <= 3; step++) {
+        setCaptureStep(step);
+        setPrompt(`Capturing photo ${step} of 3...`);
+        
+        const photo = await cameraRef.current.takePhoto({ qualityPrioritization: 'speed' });
+        const faces = faceDetector.detectFaces(photo.path);
+        
+        if (faces.length !== 1) {
+            throw new Error(`Expected exactly 1 face, found ${faces.length}. Please retry.`);
+        }
+        
+        const face = faces[0];
+        const image = await Images.loadFromFileAsync(photo.path);
+        
+        const startX = Math.max(0, face.bounds.x);
+        const startY = Math.max(0, face.bounds.y);
+        const endX = Math.min(image.width, face.bounds.x + face.bounds.width);
+        const endY = Math.min(image.height, face.bounds.y + face.bounds.height);
+        
+        const cropped = image.crop(startX, startY, endX, endY);
+        const resized = cropped.resize(112, 112);
+        
+        const outputData = resized.toRawPixelData();
+        const rgba = new Uint8Array(outputData.buffer);
+        const rgbFloat = new Float32Array(112 * 112 * 3);
+
+        const isBGRA = outputData.pixelFormat === 'BGRA' || (outputData.pixelFormat as any) === 'bgra';
+        const isARGB = outputData.pixelFormat === 'ARGB' || (outputData.pixelFormat as any) === 'argb';
+
+        let j = 0;
+        for (let i = 0; i < rgba.length; i += 4) {
+          let r: number, g: number, b: number;
+          if (isBGRA) {
+            b = rgba[i]; g = rgba[i + 1]; r = rgba[i + 2];
+          } else if (isARGB) {
+            r = rgba[i + 1]; g = rgba[i + 2]; b = rgba[i + 3];
+          } else {
+            r = rgba[i]; g = rgba[i + 1]; b = rgba[i + 2];
+          }
+          rgbFloat[j++] = ((r / 255.0) - 0.5) * 2.0;
+          rgbFloat[j++] = ((g / 255.0) - 0.5) * 2.0;
+          rgbFloat[j++] = ((b / 255.0) - 0.5) * 2.0;
+        }
+
+        const outputBuffers = tfliteModel.model.runSync([rgbFloat.buffer]);
+        const embeddingArray = Array.from(new Float32Array(outputBuffers[0]));
+        embeddings.push(embeddingArray);
+        
+        // Wait 1 second before next shot
+        if (step < 3) {
+            await new Promise(res => setTimeout(() => res(null), 1000));
+        }
+      }
+      
+      setPrompt('Saving face data...');
+      await submitEmbeddings(embeddings);
+      
+    } catch (e: any) {
+      setEnrollError(e.message);
+      setCaptureStep(0);
+      setPrompt('Position your face in the frame');
     } finally {
       setEnrolling(false);
     }
-  }, [account, setHasMobileEnrollment]);
-
-  const lastTickRef = useRef(0);
-  const handleFrameTick = useCallback(() => {
-    const now = Date.now();
-    if (now - lastTickRef.current > 500) {
-      setFrameCount(prev => prev + 1);
-      lastTickRef.current = now;
-    }
-  }, []);
-
-  const { frameOutput } = useFaceProcessor({
-    onLivenessChange: handleLivenessStateChange,
-    onFaceEmbedding: handleFaceEnrolled,
-    onFrameTick: handleFrameTick,
-    onDebugChange: setDebugData,
-    onError: setWorkletError,
-    tfliteModel,
-  });
-
-  // ── Step indicator ────────────────────────────────────────────────────────
-  const steps: LivenessState[] = ['WAITING', 'BLINK', 'TURN_LEFT', 'TURN_RIGHT', 'CAPTURING'];
-  const stepIdx = steps.indexOf(uiLivenessState);
+  };
 
   if (initState === 'ERROR') {
     return (
@@ -153,8 +215,8 @@ export default function EnrollFaceScreen() {
         <Text style={styles.permissionIcon}>❌</Text>
         <Text style={styles.permissionTitle}>Initialization Failed</Text>
         <Text style={styles.permissionText}>{initError}</Text>
-        <TouchableOpacity style={styles.devBypassBtn} onPress={() => { setInitState('REQUESTING_PERMISSION'); setInitError(null); }}>
-          <Text style={styles.devBypassText}>Retry</Text>
+        <TouchableOpacity style={styles.outlineBtn} onPress={() => { setInitState('REQUESTING_PERMISSION'); setInitError(null); }}>
+          <Text style={styles.outlineBtnText}>Retry</Text>
         </TouchableOpacity>
       </SafeAreaView>
     );
@@ -174,58 +236,44 @@ export default function EnrollFaceScreen() {
       <StatusBar barStyle="light-content" backgroundColor="black" />
       {device && (
         <Camera
+          ref={cameraRef}
           style={StyleSheet.absoluteFill}
           device={device}
-          isActive={!enrolling && uiLivenessState !== 'DONE'}
-          outputs={[frameOutput]}
+          isActive={true}
         />
-      )}
-
-      {__DEV__ && (
-        <View style={styles.debugOverlay}>
-          <Text style={styles.debugText}>Error: {workletError || 'None'}</Text>
-          <Text style={styles.debugText}>Cam: {device?.name} (Perm: {String(hasPermission)})</Text>
-          <Text style={styles.debugText}>Frame: {debugData?.frameCount || 0}</Text>
-          <Text style={styles.debugText}>Fmt: {debugData?.pixelFormat} {debugData?.width}x{debugData?.height}</Text>
-          <Text style={styles.debugText}>Faces: {debugData?.facesDetected || 0}</Text>
-        </View>
       )}
 
       <SafeAreaView edges={['top']} style={styles.topHeader}>
         <Text style={styles.headerTitle}>Face Enrollment</Text>
-        <Text style={styles.headerSub}>Step {Math.max(1, stepIdx + 1)} of {steps.length} | Frames: {frameCount}</Text>
+        <Text style={styles.headerSub}>Static Capture Mode</Text>
       </SafeAreaView>
 
       {/* Bottom card */}
       <View style={styles.bottomCard}>
         {/* Progress dots */}
         <View style={styles.dots}>
-          {steps.map((s, i) => (
+          {[1, 2, 3].map((s) => (
             <View
               key={s}
-              style={[styles.dot, i <= stepIdx && styles.dotActive]}
+              style={[styles.dot, captureStep >= s && styles.dotActive]}
             />
           ))}
         </View>
 
         <Text style={styles.prompt}>{prompt}</Text>
-
-        {enrolling && (
-          <View style={styles.enrollingRow}>
-            <ActivityIndicator color={T.colors.primary} />
-            <Text style={styles.enrollingText}>Saving face data…</Text>
-          </View>
+        
+        {enrollError && (
+          <Text style={styles.errorText}>{enrollError}</Text>
         )}
 
-        {__DEV__ && uiLivenessState !== 'DONE' && !enrolling && (
-          <TouchableOpacity
-            style={styles.devBypassBtn}
-            onPress={() => {
-              const mock = Array(192).fill(0).map(() => Math.random() * 2 - 1);
-              handleFaceEnrolled(mock);
-            }}
-          >
-            <Text style={styles.devBypassText}>[DEV] Bypass Liveness</Text>
+        {enrolling ? (
+          <View style={styles.enrollingRow}>
+            <ActivityIndicator color={T.colors.primary} />
+            <Text style={styles.enrollingText}>Processing...</Text>
+          </View>
+        ) : (
+          <TouchableOpacity style={styles.captureBtn} onPress={startCaptureSequence}>
+            <Text style={styles.captureBtnText}>Start Capture</Text>
           </TouchableOpacity>
         )}
       </View>
@@ -323,33 +371,34 @@ const styles = StyleSheet.create({
     color: T.colors.textMuted,
     fontSize: T.fontSize.sm,
   },
-  devBypassBtn: {
-    marginTop: T.spacing.md,
-    paddingVertical: T.spacing.sm,
-    paddingHorizontal: T.spacing.md,
-    borderRadius: T.radius.md,
-    borderWidth: 1,
-    borderColor: T.colors.warning,
+  errorText: {
+    color: T.colors.error,
+    fontSize: T.fontSize.sm,
+    textAlign: 'center',
+    marginBottom: T.spacing.md,
+  },
+  captureBtn: {
+    backgroundColor: T.colors.primary,
+    paddingVertical: T.spacing.md,
+    paddingHorizontal: T.spacing.xl,
+    borderRadius: T.radius.lg,
+    alignItems: 'center',
+    width: '100%',
+  },
+  captureBtnText: {
+    color: '#fff',
+    fontSize: T.fontSize.base,
+    fontWeight: '700',
+  },
+  outlineBtn: {
+    marginTop: T.spacing.sm,
+    paddingVertical: T.spacing.md,
+    width: '100%',
     alignItems: 'center',
   },
-  devBypassText: {
-    color: T.colors.warning,
-    fontSize: T.fontSize.sm,
+  outlineBtnText: {
+    color: T.colors.textSecondary,
+    fontSize: T.fontSize.base,
     fontWeight: '600',
-  },
-  debugOverlay: {
-    position: 'absolute',
-    top: 90,
-    left: 20,
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    padding: 10,
-    borderRadius: 8,
-    zIndex: 100,
-  },
-  debugText: {
-    color: '#0f0',
-    fontFamily: 'monospace',
-    fontSize: 10,
-    lineHeight: 14,
   },
 });

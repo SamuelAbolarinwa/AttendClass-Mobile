@@ -9,7 +9,7 @@ import {
   StatusBar,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
+import { Camera, useCameraDevice, useCameraPermission, usePhotoOutput } from 'react-native-vision-camera';
 import { useTensorflowModel } from 'react-native-fast-tflite';
 import { useImageFaceDetector } from 'react-native-vision-camera-face-detector';
 import { Images } from 'react-native-nitro-image';
@@ -23,6 +23,7 @@ export default function EnrollFaceScreen() {
   const { account, setHasMobileEnrollment } = useAuth();
   const device = useCameraDevice('front');
   const cameraRef = useRef<any>(null);
+  const photoOutput = usePhotoOutput({ qualityPrioritization: 'speed' });
   const faceDetector = useImageFaceDetector({
     performanceMode: 'accurate',
     runLandmarks: false,
@@ -147,15 +148,16 @@ export default function EnrollFaceScreen() {
         setCaptureStep(step);
         setPrompt(`Capturing photo ${step} of 3...`);
         
-        const photo = await cameraRef.current.takePhoto({ qualityPrioritization: 'speed' });
-        const faces = faceDetector.detectFaces(photo.path);
+        const photo = await photoOutput.capturePhoto({}, {});
+        const photoPath = await photo.saveToTemporaryFileAsync();
+        const faces = faceDetector.detectFaces(photoPath);
         
         if (faces.length !== 1) {
             throw new Error(`Expected exactly 1 face, found ${faces.length}. Please retry.`);
         }
         
         const face = faces[0];
-        const image = await Images.loadFromFileAsync(photo.path);
+        const image = await Images.loadFromFileAsync(photoPath);
         
         const startX = Math.max(0, face.bounds.x);
         const startY = Math.max(0, face.bounds.y);
@@ -187,9 +189,11 @@ export default function EnrollFaceScreen() {
           rgbFloat[j++] = ((b / 255.0) - 0.5) * 2.0;
         }
 
-        const outputBuffers = tfliteModel.model.runSync([rgbFloat.buffer]);
+        const outputBuffers = await tfliteModel.model.run([rgbFloat.buffer]);
         const embeddingArray = Array.from(new Float32Array(outputBuffers[0]));
         embeddings.push(embeddingArray);
+        
+        photo.dispose();
         
         // Wait 1 second before next shot
         if (step < 3) {
@@ -201,7 +205,7 @@ export default function EnrollFaceScreen() {
       await submitEmbeddings(embeddings);
       
     } catch (e: any) {
-      setEnrollError(e.message);
+      setEnrollError(e.message + (e.stack ? '\n' + e.stack : ''));
       setCaptureStep(0);
       setPrompt('Position your face in the frame');
     } finally {
@@ -240,6 +244,7 @@ export default function EnrollFaceScreen() {
           style={StyleSheet.absoluteFill}
           device={device}
           isActive={true}
+          outputs={[photoOutput]}
         />
       )}
 

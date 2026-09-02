@@ -86,7 +86,7 @@ export default function CheckInScreen({ navigation }: any) {
     try {
       const photo = await photoOutput.capturePhoto({}, {});
       const photoPath = await photo.saveToTemporaryFileAsync();
-      const faces = faceDetector.detectFaces(photoPath);
+      const faces = faceDetector.detectFaces({ uri: 'file://' + photoPath });
       
       if (faces.length !== 1) {
           throw new Error(`Expected exactly 1 face, found ${faces.length}. Please retry.`);

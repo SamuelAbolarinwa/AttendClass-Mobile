@@ -150,7 +150,7 @@ export default function EnrollFaceScreen() {
         
         const photo = await photoOutput.capturePhoto({}, {});
         const photoPath = await photo.saveToTemporaryFileAsync();
-        const faces = faceDetector.detectFaces({ uri: 'file://' + photoPath });
+        const faces = faceDetector.detectFaces('file://' + photoPath);
         
         if (faces.length !== 1) {
             throw new Error(`Expected exactly 1 face, found ${faces.length}. Please retry.`);

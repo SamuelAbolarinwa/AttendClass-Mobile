@@ -1,0 +1,69 @@
+diff --git a/node_modules/react-native-vision-camera-face-detector/android/src/main/java/com/margelo/nitro/camera/facedetector/HybridImageFaceDetector.kt b/node_modules/react-native-vision-camera-face-detector/android/src/main/java/com/margelo/nitro/camera/facedetector/HybridImageFaceDetector.kt
+index 5d116a9..b582b5d 100644
+--- a/node_modules/react-native-vision-camera-face-detector/android/src/main/java/com/margelo/nitro/camera/facedetector/HybridImageFaceDetector.kt
++++ b/node_modules/react-native-vision-camera-face-detector/android/src/main/java/com/margelo/nitro/camera/facedetector/HybridImageFaceDetector.kt
+@@ -22,14 +22,11 @@ class HybridImageFaceDetector(
+   )
+ 
+   private fun resolveInputImage(
+-    input: Any?
++    input: InputImage
+   ): String {
+-    return when (input) {
+-      is String -> input
+-      is Map<*, *> -> {
+-        val uri = input["uri"] as? String
+-        uri ?: throw IllegalArgumentException("Invalid image object: missing 'uri'")
+-      }
++    return when {
++      input.isFirst -> input.asFirstOrNull()!!
++      input.isThird -> input.asThirdOrNull()!!.uri
+       else -> throw IllegalArgumentException("Invalid image type. Expected string or { uri }")
+     }
+   }
+diff --git a/node_modules/react-native-vision-camera-face-detector/ios/HybridImageFaceDetector.swift b/node_modules/react-native-vision-camera-face-detector/ios/HybridImageFaceDetector.swift
+index 608050c..c2853ee 100644
+--- a/node_modules/react-native-vision-camera-face-detector/ios/HybridImageFaceDetector.swift
++++ b/node_modules/react-native-vision-camera-face-detector/ios/HybridImageFaceDetector.swift
+@@ -52,27 +52,24 @@ class HybridImageFaceDetector: HybridImageFaceDetectorSpec {
+   }
+ 
+   private func resolveInputImage(
+-    _ input: Any
++    _ input: InputImage
+   ) throws -> String {
+-    if let uri = input as? String {
+-      return uri
+-    }
+-
+-    if let object = input as? [String: Any],
+-      let uri = object["uri"] as? String {
++    switch input {
++    case .first(let uri):
+       return uri
++    case .third(let object):
++      return object.uri
++    default:
++      throw NSError(
++        domain: "HybridImageFaceDetector",
++        code: -1,
++        userInfo: [
++          NSLocalizedDescriptionKey:
++          "Invalid image type. Expected string or { uri }"
++        ]
++      )
+     }
+ 
+-    throw NSError(
+-      domain: "HybridImageFaceDetector",
+-      code: -1,
+-      userInfo: [
+-        NSLocalizedDescriptionKey:
+-        "Invalid image type. Expected string or { uri }"
+-      ]
+-    )
+-  }
+-
+   private func createInputImage(
+     uri: String
+   ) throws -> UIImage {

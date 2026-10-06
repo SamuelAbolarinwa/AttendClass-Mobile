@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   View,
   Text,
@@ -90,16 +90,18 @@ export default function EnrollFaceScreen() {
         setInitError('Timed out loading TFLite model.');
       }, 10000);
       
-      if (tfliteModel.state === 'loaded' && tfliteModel.model) {
+      const modelState = tfliteModel.state;
+      const modelError = (tfliteModel as any).error?.message;
+      if (modelState === 'loaded' && tfliteModel.model) {
         setInitState('LOOKING_FOR_FACE');
-      } else if (tfliteModel.state === 'error') {
+      } else if (modelState === 'error') {
         setInitState('ERROR');
-        // @ts-ignore
-        setInitError(tfliteModel.error?.message || 'Failed to load model.');
+        setInitError(modelError || 'Failed to load model.');
       }
       return () => clearTimeout(timeout);
     }
-  }, [initState, tfliteModel.state, tfliteModel.model, (tfliteModel as any).error]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initState, tfliteModel.state, tfliteModel.model]);
 
   const submitEmbeddings = async (embeddings: number[][]) => {
     try {
@@ -230,7 +232,7 @@ export default function EnrollFaceScreen() {
     return (
       <SafeAreaView style={styles.center}>
         <ActivityIndicator size="large" color={T.colors.primary} />
-        <Text style={[styles.permissionTitle, { marginTop: 20 }]}>{initState.replace(/_/g, ' ')}</Text>
+        <Text style={[styles.permissionTitle, styles.loadingText]}>{initState.replace(/_/g, ' ')}</Text>
       </SafeAreaView>
     );
   }
@@ -287,6 +289,9 @@ export default function EnrollFaceScreen() {
 }
 
 const styles = StyleSheet.create({
+  loadingText: {
+    marginTop: 20,
+  },
   container: {
     flex: 1,
     backgroundColor: 'black',

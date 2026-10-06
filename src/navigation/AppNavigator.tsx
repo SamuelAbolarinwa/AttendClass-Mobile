@@ -14,7 +14,7 @@ import CheckInScreen from '../screens/CheckInScreen';
 const Stack = createNativeStackNavigator();
 
 export default function AppNavigator() {
-  const { account, loading, hasMobileEnrollment } = useAuth();
+  const { account, loading } = useAuth();
 
   if (loading) {
     return (

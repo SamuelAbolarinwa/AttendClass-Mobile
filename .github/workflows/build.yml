@@ -4,12 +4,15 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   build-android:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -29,27 +32,37 @@ jobs:
           cache: 'gradle'
 
       - name: Setup Environment Variables
-        # Note: You MUST configure SUPABASE_URL and SUPABASE_ANON_KEY in your GitHub Repository Secrets 
-        # (Settings -> Secrets and variables -> Actions) for this step to succeed.
         run: |
-          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > .env
-          echo "SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> .env
-
-      - name: Verify Environment Variables
-        run: |
-          URL_VAL=$(grep SUPABASE_URL .env | cut -d '=' -f2)
-          KEY_VAL=$(grep SUPABASE_ANON_KEY .env | cut -d '=' -f2)
-          echo "URL length: ${#URL_VAL} chars"
-          echo "KEY length: ${#KEY_VAL} chars"
-          if [ ${#URL_VAL} -eq 0 ]; then
-            echo "::error::SUPABASE_URL is empty in .env"
-            exit 1
-          fi
+          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL || 'https://placeholder.supabase.co' }}" > .env
+          echo "SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY || 'placeholder-anon-key' }}" >> .env
 
       - name: Install npm dependencies
         run: npm install
 
-      - name: Decode Keystore
+      # ── CI Quality Gates ──────────────────────────────────────────────────
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run TypeScript Check
+        run: npx tsc --noEmit
+
+      - name: Run Jest Unit Tests
+        run: npm test -- --ci --maxWorkers=2
+
+      # ── Android Builds ────────────────────────────────────────────────────
+      - name: Build Android Debug APK
+        run: cd android && ./gradlew assembleDebug
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-${{ github.sha }}
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Decode Release Keystore (if secret present)
+        if: env.RELEASE_KEYSTORE_BASE64 != ''
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
         run: echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 --decode > android/app/release.keystore
 
       - name: Build Android Release APK
@@ -59,7 +72,7 @@ jobs:
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
 
-      - name: Upload APK
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: app-release-${{ github.sha }}

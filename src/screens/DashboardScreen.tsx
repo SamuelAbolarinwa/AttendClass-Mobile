@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   View,
   Text,
@@ -28,7 +28,7 @@ export default function DashboardScreen({ navigation }: any) {
   const [endDate, setEndDate] = useState<Date>(new Date());
   const [cancelledDays, setCancelledDays] = useState<Set<string>>(new Set());
 
-  const fetchDashboardData = async () => {
+  const fetchDashboardData = useCallback(async () => {
     if (!account) return;
     setError(null);
 
@@ -83,7 +83,7 @@ export default function DashboardScreen({ navigation }: any) {
       setLoading(false);
       setRefreshing(false);
     }
-  };
+  }, [account]);
 
   React.useEffect(() => {
     const unsub = navigation.addListener('focus', () => {
@@ -91,7 +91,7 @@ export default function DashboardScreen({ navigation }: any) {
       fetchDashboardData();
     });
     return unsub;
-  }, [navigation, account]);
+  }, [navigation, fetchDashboardData]);
 
   const onRefresh = () => {
     setRefreshing(true);
@@ -202,7 +202,7 @@ export default function DashboardScreen({ navigation }: any) {
           )}
         </View>
 
-        <View style={{ height: 96 }} />
+        <View style={styles.bottomSpacer} />
       </ScrollView>
 
       {/* FAB */}
@@ -219,6 +219,7 @@ export default function DashboardScreen({ navigation }: any) {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: T.colors.bg },
+  bottomSpacer: { height: 96 },
   header: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -10,6 +10,7 @@ import {
   TerminalChallengePayload,
   AttendanceSubmissionPayload,
   TerminalAckPayload,
+  FrameReassembler,
 } from './AttendanceProtocol';
 import { DiagnosticLogger } from './DiagnosticLogger';
 
@@ -28,6 +29,7 @@ export type BleTransportErrorCode =
   | 'DISCONNECTED'
   | 'CHALLENGE_READ_FAILED'
   | 'SUBMISSION_WRITE_FAILED'
+  | 'SUBMISSION_PENDING_RECONCILIATION'
   | 'ACK_TIMEOUT'
   | 'TERMINAL_REJECTED'
   | 'TRANSACTION_CANCELLED';
@@ -35,7 +37,6 @@ export type BleTransportErrorCode =
 export class BleTransportService {
   private bleManager: BleManager;
   private connectedDevice: Device | null = null;
-  private scanSubscription: Subscription | null = null;
   private isScanning = false;
   private cancelled = false;
 
@@ -122,7 +123,11 @@ export class BleTransportService {
       }
       return { ok: false, state, error: `Bluetooth unavailable (${state}).` };
     } catch (err: unknown) {
-      return { ok: false, state: State.Unknown, error: `Failed to query Bluetooth state: ${err instanceof Error ? err.message : String(err)}` };
+      return {
+        ok: false,
+        state: State.Unknown,
+        error: `Failed to query Bluetooth state: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 
@@ -258,89 +263,142 @@ export class BleTransportService {
 
   /**
    * Submit signed attendance response and await persistent SD acknowledgement.
+   *
+   * Crucial reliability improvements:
+   * 1. Subscribes for ACK BEFORE writing submission to avoid race conditions.
+   * 2. Frames/chunks payload when necessary to fit within bounded MTU.
+   * 3. Treats post-submission disconnects as uncertain outcome (SUBMISSION_PENDING_RECONCILIATION).
    */
   public async submitAttendanceAndAwaitAck(
     device: Device,
     submission: AttendanceSubmissionPayload,
     timeoutMs = 12000,
   ): Promise<TerminalAckPayload> {
-    const rawSubmissionBase64 = AttendanceProtocol.serializeSubmission(submission);
+    const rawSubmissionJson = JSON.stringify(submission);
+    const submissionBase64 = AttendanceProtocol.serializeSubmission(submission);
+    const txId = submission.event_id.substring(0, 8);
 
-    // Write submission to characteristic
-    try {
-      await device.writeCharacteristicWithResponseForService(
-        ATTENDCLASS_SERVICE_UUID,
-        SUBMISSION_CHAR_UUID,
-        rawSubmissionBase64,
-      );
-      DiagnosticLogger.info('BLE_SUBMIT', 'Attendance packet written to terminal characteristic');
-    } catch (writeErr: unknown) {
-      const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-      throw new Error(`SUBMISSION_WRITE_FAILED: Failed to write attendance payload to terminal: ${msg}`);
-    }
+    let ackReceived = false;
+    let writeCompleted = false;
 
-    // Await durable-save acknowledgement on ACK characteristic
     return new Promise<TerminalAckPayload>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout>;
       let sub: Subscription | null = null;
+      const reassembler = new FrameReassembler(timeoutMs);
 
-      const finish = () => {
+      const cleanup = () => {
         clearTimeout(timer);
         if (sub) {
-          sub.remove();
+          try {
+            sub.remove();
+          } catch {
+            // ignore
+          }
           sub = null;
         }
       };
 
+      // Set timeout for entire submission and ACK lifecycle
       timer = setTimeout(async () => {
-        finish();
-        // One fallback read before timing out
-        try {
-          const char = await device.readCharacteristicForService(
-            ATTENDCLASS_SERVICE_UUID,
-            ACK_CHAR_UUID,
+        cleanup();
+        if (writeCompleted && !ackReceived) {
+          // Write succeeded but ACK was not received in time -> Uncertain state!
+          // Must reconcile using the same event_id
+          reject(
+            new Error(
+              `SUBMISSION_PENDING_RECONCILIATION: Submission was sent, but terminal ACK timed out. Reconcile with event ${submission.event_id}.`,
+            ),
           );
-          if (char.value) {
-            const decoded = Buffer.from(char.value, 'base64').toString('utf-8');
-            const ack = AttendanceProtocol.parseAck(decoded, submission.event_id);
-            resolve(ack);
-            return;
-          }
-        } catch {
-          // ignore fallback error
+          return;
         }
         reject(new Error('ACK_TIMEOUT: Terminal did not confirm durable persistence within timeout period.'));
       }, timeoutMs);
 
-      // Monitor ACK characteristic
+      // ── Step 1: Subscribe for ACK BEFORE writing submission ───────────────
       try {
         sub = device.monitorCharacteristicForService(
           ATTENDCLASS_SERVICE_UUID,
           ACK_CHAR_UUID,
           (error, characteristic) => {
             if (error) {
-              finish();
-              reject(new Error(`ACK_MONITOR_ERROR: ${error.message}`));
+              cleanup();
+              if (writeCompleted && !ackReceived) {
+                reject(
+                  new Error(
+                    `SUBMISSION_PENDING_RECONCILIATION: Connection dropped after submission write. Reconcile with event ${submission.event_id}.`,
+                  ),
+                );
+              } else {
+                reject(new Error(`ACK_MONITOR_ERROR: ${error.message}`));
+              }
               return;
             }
 
             if (characteristic?.value) {
               try {
                 const decoded = Buffer.from(characteristic.value, 'base64').toString('utf-8');
+
+                // Check if ACK is sent as chunked frame
+                if (decoded.startsWith('ATTF1:')) {
+                  const res = reassembler.addFrame(decoded);
+                  if (!res.complete || !res.payload) return;
+                  const ack = AttendanceProtocol.parseAck(res.payload, submission.event_id);
+                  ackReceived = true;
+                  cleanup();
+                  resolve(ack);
+                  return;
+                }
+
+                // Normal single-packet ACK
                 const ack = AttendanceProtocol.parseAck(decoded, submission.event_id);
-                finish();
+                ackReceived = true;
+                cleanup();
                 resolve(ack);
               } catch (parseErr: unknown) {
-                finish();
+                cleanup();
                 reject(parseErr);
               }
             }
           },
         );
       } catch (monErr: unknown) {
-        finish();
+        cleanup();
         reject(monErr);
+        return;
       }
+
+      // ── Step 2: Write submission payload (chunked or single) ───────────────
+      (async () => {
+        try {
+          // If payload is larger than standard 120 bytes, split into bounded frames
+          if (submissionBase64.length > 120) {
+            const frames = AttendanceProtocol.createFrames(rawSubmissionJson, txId, 90);
+            for (const frame of frames) {
+              const frameB64 = Buffer.from(frame, 'utf-8').toString('base64');
+              await device.writeCharacteristicWithResponseForService(
+                ATTENDCLASS_SERVICE_UUID,
+                SUBMISSION_CHAR_UUID,
+                frameB64,
+              );
+            }
+          } else {
+            await device.writeCharacteristicWithResponseForService(
+              ATTENDCLASS_SERVICE_UUID,
+              SUBMISSION_CHAR_UUID,
+              submissionBase64,
+            );
+          }
+
+          writeCompleted = true;
+          DiagnosticLogger.info('BLE_SUBMIT', 'Attendance packet written to terminal characteristic', {
+            eventId: submission.event_id,
+          });
+        } catch (writeErr: unknown) {
+          cleanup();
+          const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+          reject(new Error(`SUBMISSION_WRITE_FAILED: Failed writing to terminal: ${msg}`));
+        }
+      })();
     });
   }
 

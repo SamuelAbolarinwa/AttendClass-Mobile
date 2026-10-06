@@ -1,19 +1,23 @@
 import { BleTransportService } from './BleTransportService';
 import { AttendanceSigner } from './AttendanceSigner';
-import { AttendanceReceiptStorage, AttendanceReceipt } from './AttendanceReceiptStorage';
+import { AttendanceReceiptStorage, AttendanceReceipt, PendingReconciliationRecord } from './AttendanceReceiptStorage';
+import { TerminalTrustStore } from './TerminalTrustStore';
 import { DiagnosticLogger } from './DiagnosticLogger';
 import { AttendanceSubmissionPayload } from './AttendanceProtocol';
 
 export type AttendanceFlowState =
   | 'IDLE'
   | 'CHECKING_STATUS'
+  | 'RECONCILING_PENDING'
   | 'SCANNING_TERMINAL'
   | 'CONNECTING_TERMINAL'
   | 'FETCHING_CHALLENGE'
+  | 'VERIFYING_TERMINAL'
   | 'LOCAL_APPROVAL'
   | 'SIGNING'
   | 'SUBMITTING_ATTENDANCE'
   | 'AWAITING_SD_ACK'
+  | 'VERIFYING_RECEIPT'
   | 'SUCCESS'
   | 'ALREADY_LOGGED'
   | 'FAILED';
@@ -37,6 +41,7 @@ export interface AttendanceTransactionResult {
 
 export class AttendanceManager {
   private transport: BleTransportService;
+  private isExecuting = false;
 
   constructor(transport?: BleTransportService) {
     this.transport = transport || new BleTransportService();
@@ -53,18 +58,28 @@ export class AttendanceManager {
   public async executeAttendance(
     params: AttendanceTransactionParams,
   ): Promise<AttendanceTransactionResult> {
+    if (this.isExecuting) {
+      return {
+        success: false,
+        state: 'FAILED',
+        errorCode: 'CONCURRENT_CHECKIN_IN_PROGRESS',
+        errorMessage: 'An attendance check-in is already in progress.',
+      };
+    }
+    this.isExecuting = true;
+
     const notify = (state: AttendanceFlowState, message: string) => {
       if (params.onStateChange) params.onStateChange(state, message);
     };
 
     const txId = DiagnosticLogger.startTransaction('ATTENDANCE_CHECKIN');
-    DiagnosticLogger.logStage(txId, 'START', 'Starting attendance transaction', {
+    DiagnosticLogger.logStage(txId, 'START', 'Starting attendance check-in transaction', {
       studentId: params.studentId,
       matricNumber: params.matricNumber,
     });
 
     try {
-      // 1. Check if already logged today
+      // ── Step 1: Check if already logged today ────────────────────────────
       notify('CHECKING_STATUS', 'Checking today’s attendance records...');
       const todayCheck = await AttendanceReceiptStorage.hasLoggedToday(params.accountId);
       if (todayCheck.logged && todayCheck.receipt) {
@@ -78,7 +93,7 @@ export class AttendanceManager {
         };
       }
 
-      // 2. Check if device is enrolled
+      // ── Step 2: Check if device is enrolled ──────────────────────────────
       const isEnrolled = await AttendanceSigner.hasEnrolledDeviceKey(params.accountId);
       if (!isEnrolled) {
         const err = 'Device is not enrolled. Please complete device activation first.';
@@ -93,7 +108,16 @@ export class AttendanceManager {
         };
       }
 
-      // 3. Scan for nearby BLE Terminal
+      // ── Step 3: Check for pending reconciliation from dropped connection ──
+      const pendingRecon = await AttendanceReceiptStorage.getPendingReconciliation(params.accountId);
+      if (pendingRecon) {
+        notify('RECONCILING_PENDING', 'Reconciling previously submitted attendance...');
+        DiagnosticLogger.info('RECONCILIATION', 'Attempting reconciliation for existing event', {
+          eventId: pendingRecon.eventId,
+        });
+      }
+
+      // ── Step 4: Scan for nearby authorized BLE Terminal ─────────────────
       notify('SCANNING_TERMINAL', 'Searching for class attendance terminal...');
       DiagnosticLogger.logStage(txId, 'BLE_SCAN', 'Scanning for terminal');
 
@@ -104,95 +128,192 @@ export class AttendanceManager {
 
       DiagnosticLogger.logStage(txId, 'BLE_FOUND', `Found terminal: ${terminalDevice.name || terminalDevice.id}`);
 
-      // 4. Connect to terminal
+      // ── Step 5: Connect to terminal ─────────────────────────────────────
       notify('CONNECTING_TERMINAL', 'Connecting to attendance terminal...');
       const connected = await this.transport.connect(terminalDevice);
 
-      // 5. Fetch fresh challenge
+      // ── Step 6: Fetch & cryptographically verify terminal challenge ─────
       notify('FETCHING_CHALLENGE', 'Requesting fresh attendance challenge...');
       const challenge = await this.transport.fetchChallenge(connected);
-      DiagnosticLogger.logStage(txId, 'CHALLENGE_RECEIVED', 'Challenge received', {
-        terminalId: challenge.terminal_id,
-        sessionId: challenge.session_id,
-      });
 
-      // 6. Request OS Local Approval & Sign Challenge
-      notify('LOCAL_APPROVAL', 'Please authenticate to confirm attendance...');
-      const eventId = Math.random().toString(36).substring(2, 15) + '-' + Date.now().toString(36);
-      const timestamp = Math.floor(Date.now() / 1000);
-
-      const signRes = await AttendanceSigner.signAttendance({
-        accountId: params.accountId,
-        studentId: params.studentId,
-        matricNumber: params.matricNumber,
-        terminalId: challenge.terminal_id,
-        sessionId: challenge.session_id,
-        challengeBase64: challenge.challenge,
-        timestamp,
-        eventId,
-      });
-
-      if (!signRes.success || !signRes.signatureBase64 || !signRes.publicKeyBase64) {
+      notify('VERIFYING_TERMINAL', 'Verifying terminal authenticity...');
+      const challengeVerification = TerminalTrustStore.verifyTerminalChallenge(challenge);
+      if (!challengeVerification.valid) {
         await this.transport.disconnect();
-        DiagnosticLogger.logError(txId, 'SIGNING', signRes.errorCode || 'SIGN_FAILED', signRes.errorMessage || 'Signing failed');
-        notify('FAILED', signRes.errorMessage || 'Signing was cancelled or failed.');
+        const err = challengeVerification.reason || 'Terminal verification failed';
+        DiagnosticLogger.logError(txId, 'AUTH_TERMINAL', 'TERMINAL_VERIFICATION_FAILED', err);
+        notify('FAILED', err);
         return {
           success: false,
           state: 'FAILED',
-          errorCode: signRes.errorCode || 'SIGN_FAILED',
-          errorMessage: signRes.errorMessage || 'Signing was cancelled or failed.',
+          errorCode: 'TERMINAL_VERIFICATION_FAILED',
+          errorMessage: err,
           transactionId: txId,
         };
       }
 
-      // 7. Assemble submission packet
+      DiagnosticLogger.logStage(txId, 'CHALLENGE_VERIFIED', 'Terminal challenge verified', {
+        terminalId: challenge.terminal_id,
+        sessionId: challenge.session_id,
+        timeConfidence: challenge.time_confidence,
+      });
+
+      // ── Step 7: Local Approval & Sign Challenge (or reuse pending) ───────
+      let submission: AttendanceSubmissionPayload;
+      let submissionDigest: string;
+
+      if (pendingRecon && pendingRecon.sessionId === challenge.session_id) {
+        // Reconcile using previously signed submission and exact same event_id!
+        submission = pendingRecon.submissionPayload;
+        submissionDigest = TerminalTrustStore.computeSubmissionDigest(
+          AttendanceSigner.buildCanonicalMessage(
+            {
+              accountId: params.accountId,
+              studentId: params.studentId,
+              matricNumber: params.matricNumber,
+              terminalId: submission.terminal_id,
+              sessionId: submission.session_id,
+              challengeBase64: submission.challenge,
+              timestamp: submission.timestamp,
+              eventId: submission.event_id,
+            },
+            submission.credential_id,
+          ),
+        );
+        DiagnosticLogger.info('RECONCILIATION', 'Reusing signed submission with same eventId', {
+          eventId: submission.event_id,
+        });
+      } else {
+        notify('LOCAL_APPROVAL', 'Please authenticate to confirm attendance...');
+        const eventId = Math.random().toString(36).substring(2, 15) + '-' + Date.now().toString(36);
+        const timestamp = Math.floor(Date.now() / 1000); // Phone provisional time
+
+        const signRes = await AttendanceSigner.signAttendance({
+          accountId: params.accountId,
+          studentId: params.studentId,
+          matricNumber: params.matricNumber,
+          terminalId: challenge.terminal_id,
+          sessionId: challenge.session_id,
+          challengeBase64: challenge.challenge,
+          timestamp,
+          eventId,
+        });
+
+        if (!signRes.success || !signRes.signatureBase64 || !signRes.canonicalMessage) {
+          await this.transport.disconnect();
+          DiagnosticLogger.logError(
+            txId,
+            'SIGNING',
+            signRes.errorCode || 'SIGN_FAILED',
+            signRes.errorMessage || 'Signing failed or was cancelled',
+          );
+          notify('FAILED', signRes.errorMessage || 'Signing was cancelled or failed.');
+          return {
+            success: false,
+            state: 'FAILED',
+            errorCode: signRes.errorCode || 'SIGN_FAILED',
+            errorMessage: signRes.errorMessage || 'Signing was cancelled or failed.',
+            transactionId: txId,
+          };
+        }
+
+        submissionDigest = TerminalTrustStore.computeSubmissionDigest(signRes.canonicalMessage);
+
+        submission = {
+          version: 1,
+          event_id: eventId,
+          credential_id: signRes.credentialId || 'unknown_cred',
+          credential_version: signRes.credentialVersion || 'v1',
+          algorithm: 'ECDSA_P256_SHA256',
+          student_id: params.studentId,
+          matric_number: params.matricNumber,
+          terminal_id: challenge.terminal_id,
+          session_id: challenge.session_id,
+          challenge: challenge.challenge,
+          timestamp,
+          timestamp_source: 'phone_os',
+          public_key: signRes.publicKeyBase64 || '',
+          signature: signRes.signatureBase64,
+        };
+      }
+
+      // ── Step 8: Submit and await durable SD persistence ACK ───────────────
       notify('SUBMITTING_ATTENDANCE', 'Sending signed attendance response...');
-      const submission: AttendanceSubmissionPayload = {
-        version: 1,
-        event_id: eventId,
-        student_id: params.studentId,
-        matric_number: params.matricNumber,
-        terminal_id: challenge.terminal_id,
-        session_id: challenge.session_id,
-        challenge: challenge.challenge,
-        timestamp,
-        timestamp_source: 'phone_os',
-        public_key: signRes.publicKeyBase64,
-        signature: signRes.signatureBase64,
-      };
-
-      // 8. Submit and wait for durable SD persistence ACK
       notify('AWAITING_SD_ACK', 'Awaiting terminal durable save confirmation...');
-      const ack = await this.transport.submitAttendanceAndAwaitAck(connected, submission, 12000);
 
-      DiagnosticLogger.logStage(txId, 'ACK_RECEIVED', 'Durable save acknowledged by terminal', {
+      let ack;
+      try {
+        ack = await this.transport.submitAttendanceAndAwaitAck(connected, submission, 12000);
+      } catch (submitErr: unknown) {
+        const errorMsg = submitErr instanceof Error ? submitErr.message : String(submitErr);
+        if (errorMsg.includes('SUBMISSION_PENDING_RECONCILIATION')) {
+          // Store pending reconciliation record so retry uses the exact same eventId
+          const pendingRec: PendingReconciliationRecord = {
+            eventId: submission.event_id,
+            accountId: params.accountId,
+            studentId: params.studentId,
+            matricNumber: params.matricNumber,
+            terminalId: submission.terminal_id,
+            sessionId: submission.session_id,
+            submissionPayload: submission,
+            createdAtIso: new Date().toISOString(),
+          };
+          await AttendanceReceiptStorage.savePendingReconciliation(pendingRec);
+        }
+        throw submitErr;
+      }
+
+      // ── Step 9: Authenticate terminal durable receipt ─────────────────────
+      notify('VERIFYING_RECEIPT', 'Authenticating terminal durable receipt...');
+      const receiptVerification = TerminalTrustStore.verifyTerminalReceipt(ack, submissionDigest);
+      if (!receiptVerification.valid) {
+        await this.transport.disconnect();
+        const err = receiptVerification.reason || 'Terminal receipt could not be authenticated';
+        DiagnosticLogger.logError(txId, 'RECEIPT_AUTH', 'RECEIPT_VERIFICATION_FAILED', err);
+        notify('FAILED', err);
+        return {
+          success: false,
+          state: 'FAILED',
+          errorCode: 'RECEIPT_VERIFICATION_FAILED',
+          errorMessage: err,
+          transactionId: txId,
+        };
+      }
+
+      DiagnosticLogger.logStage(txId, 'ACK_VERIFIED', 'Durable save receipt cryptographically verified', {
         sdPersisted: ack.sd_persisted,
         recordIndex: ack.record_index,
       });
 
-      // 9. Persist local receipt
+      // ── Step 10: Persist local receipt with timestamp provenance ──────────
       const receipt: AttendanceReceipt = {
-        eventId,
+        eventId: submission.event_id,
         accountId: params.accountId,
         studentId: params.studentId,
         matricNumber: params.matricNumber,
         terminalId: challenge.terminal_id,
         sessionId: challenge.session_id,
-        attendanceTimestamp: timestamp,
-        attendanceTimeIso: new Date(timestamp * 1000).toISOString(),
+        attendanceTimestamp: submission.timestamp,
+        phoneTimeConfidence: 'provisional',
+        attendanceTimeIso: new Date(submission.timestamp * 1000).toISOString(),
         localReceiptTimeIso: new Date().toISOString(),
         terminalSavedAtIso: ack.saved_at ? new Date(ack.saved_at * 1000).toISOString() : undefined,
+        terminalTimeConfidence: challenge.time_confidence,
         sdRecordIndex: ack.record_index,
+        terminalReceiptSignature: ack.signature,
+        submissionDigest,
         status: 'DEVICE_CONFIRMED',
-        lagosDate: AttendanceReceiptStorage.getLagosDate(timestamp),
+        lagosDate: AttendanceReceiptStorage.getLagosDate(submission.timestamp),
       };
 
       await AttendanceReceiptStorage.saveReceipt(receipt);
+      // Clear any resolved reconciliation state
+      await AttendanceReceiptStorage.clearPendingReconciliation(params.accountId);
 
-      // 10. Clean disconnect
+      // Clean disconnect
       await this.transport.disconnect();
 
-      DiagnosticLogger.endTransaction(txId, true, 'Attendance successfully confirmed and saved to SD');
+      DiagnosticLogger.endTransaction(txId, true, 'Attendance successfully confirmed with mutual authentication');
       notify('SUCCESS', 'Attendance recorded successfully!');
 
       return {
@@ -213,6 +334,8 @@ export class AttendanceManager {
         errorMessage: msg,
         transactionId: txId,
       };
+    } finally {
+      this.isExecuting = false;
     }
   }
 }

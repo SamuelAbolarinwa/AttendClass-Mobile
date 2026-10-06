@@ -1,4 +1,5 @@
 import * as Keychain from 'react-native-keychain';
+import { AttendanceSubmissionPayload } from './AttendanceProtocol';
 import { DiagnosticLogger } from './DiagnosticLogger';
 
 export interface AttendanceReceipt {
@@ -8,19 +9,38 @@ export interface AttendanceReceipt {
   matricNumber: string;
   terminalId: string;
   sessionId: string;
-  attendanceTimestamp: number; // seconds
+  attendanceTimestamp: number; // Phone seconds (provisional)
+  phoneTimeConfidence: 'provisional';
   attendanceTimeIso: string;
-  localReceiptTimeIso: string; // phone time upon receiving SD ACK
+  localReceiptTimeIso: string; // Phone time upon receiving verified SD ACK
   terminalSavedAtIso?: string;
+  terminalTimeConfidence?: 'rtc' | 'unsynchronized' | 'estimated';
   sdRecordIndex?: number;
+  terminalReceiptSignature?: string;
+  submissionDigest?: string;
   status: 'DEVICE_CONFIRMED' | 'CLOUD_SYNCHRONIZED';
   cloudUploadedAtIso?: string;
   lagosDate: string; // YYYY-MM-DD strictly calculated for Africa/Lagos
 }
 
+export interface PendingReconciliationRecord {
+  eventId: string;
+  accountId: string;
+  studentId: string;
+  matricNumber: string;
+  terminalId: string;
+  sessionId: string;
+  submissionPayload: AttendanceSubmissionPayload;
+  createdAtIso: string;
+}
+
 export class AttendanceReceiptStorage {
-  private static getServiceKey(accountId: string): string {
+  private static getReceiptsServiceKey(accountId: string): string {
     return `attendclass_receipts_${accountId}`;
+  }
+
+  private static getPendingServiceKey(accountId: string): string {
+    return `attendclass_pending_recon_${accountId}`;
   }
 
   /**
@@ -48,7 +68,7 @@ export class AttendanceReceiptStorage {
    * Retrieve all saved attendance receipts for an account.
    */
   public static async getReceipts(accountId: string): Promise<AttendanceReceipt[]> {
-    const service = this.getServiceKey(accountId);
+    const service = this.getReceiptsServiceKey(accountId);
     try {
       const res = await Keychain.getGenericPassword({ service });
       if (!res || !res.password) {
@@ -67,7 +87,7 @@ export class AttendanceReceiptStorage {
    * Save a new device-confirmed receipt idempotently.
    */
   public static async saveReceipt(receipt: AttendanceReceipt): Promise<void> {
-    const service = this.getServiceKey(receipt.accountId);
+    const service = this.getReceiptsServiceKey(receipt.accountId);
     try {
       const existing = await this.getReceipts(receipt.accountId);
       // Deduplicate by eventId
@@ -98,6 +118,53 @@ export class AttendanceReceiptStorage {
   }
 
   /**
+   * Save a transaction pending reconciliation after post-submission disconnect.
+   */
+  public static async savePendingReconciliation(pending: PendingReconciliationRecord): Promise<void> {
+    const service = this.getPendingServiceKey(pending.accountId);
+    try {
+      await Keychain.setGenericPassword(pending.accountId, JSON.stringify(pending), {
+        service,
+        accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+      });
+      DiagnosticLogger.info('RECONCILIATION', 'Saved pending transaction for reconciliation', {
+        eventId: pending.eventId,
+        terminalId: pending.terminalId,
+      });
+    } catch (err: unknown) {
+      DiagnosticLogger.warn('RECONCILIATION', 'Failed saving pending transaction', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Get any pending transaction awaiting reconciliation.
+   */
+  public static async getPendingReconciliation(accountId: string): Promise<PendingReconciliationRecord | null> {
+    const service = this.getPendingServiceKey(accountId);
+    try {
+      const res = await Keychain.getGenericPassword({ service });
+      if (!res || !res.password) return null;
+      return JSON.parse(res.password) as PendingReconciliationRecord;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Clear pending reconciliation record once resolved.
+   */
+  public static async clearPendingReconciliation(accountId: string): Promise<void> {
+    const service = this.getPendingServiceKey(accountId);
+    try {
+      await Keychain.resetGenericPassword({ service });
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
    * Mark a receipt as CLOUD_SYNCHRONIZED once Supabase or terminal confirms upload.
    */
   public static async markSynchronized(
@@ -105,7 +172,7 @@ export class AttendanceReceiptStorage {
     eventId: string,
     cloudUploadedAtIso: string,
   ): Promise<void> {
-    const service = this.getServiceKey(accountId);
+    const service = this.getReceiptsServiceKey(accountId);
     try {
       const existing = await this.getReceipts(accountId);
       const updated = existing.map((r) => {
@@ -147,10 +214,10 @@ export class AttendanceReceiptStorage {
   }
 
   /**
-   * Clear all receipts for an account (e.g. On account deletion or signout if requested).
+   * Clear all receipts for an account.
    */
   public static async clearReceipts(accountId: string): Promise<void> {
-    const service = this.getServiceKey(accountId);
+    const service = this.getReceiptsServiceKey(accountId);
     try {
       await Keychain.resetGenericPassword({ service });
     } catch {

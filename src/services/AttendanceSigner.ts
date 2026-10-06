@@ -1,14 +1,7 @@
-import * as Keychain from 'react-native-keychain';
-import { ed25519 } from '@noble/curves/ed25519.js';
-import { Buffer } from 'buffer';
+import { DeviceSecurityService, DeviceKeyMetadata } from './DeviceSecurityService';
+import { AttendanceProtocol } from './AttendanceProtocol';
 import { DiagnosticLogger } from './DiagnosticLogger';
-import { LocalApprovalService, LocalApprovalErrorCode } from './LocalApprovalService';
-
-export interface DeviceKeyRecord {
-  publicKeyBase64: string;
-  createdAt: string;
-  accountId: string;
-}
+import { LocalApprovalErrorCode } from './LocalApprovalService';
 
 export interface SignAttendanceParams {
   accountId: string;
@@ -19,159 +12,97 @@ export interface SignAttendanceParams {
   matricNumber: string;
   timestamp: number;
   eventId: string;
+  credentialId?: string;
 }
 
 export interface SignAttendanceResult {
   success: boolean;
   signatureBase64?: string;
   publicKeyBase64?: string;
+  credentialId?: string;
+  credentialVersion?: string;
+  algorithm?: 'ECDSA_P256_SHA256';
   canonicalMessage?: string;
+  securityLevel?: string;
   errorCode?: LocalApprovalErrorCode | 'KEY_NOT_FOUND' | 'SIGNING_FAILED';
   errorMessage?: string;
 }
 
 export class AttendanceSigner {
-  public static getServiceKey(accountId: string): string {
-    return `attendclass_device_key_${accountId}`;
-  }
-
   /**
-   * Generates a new Ed25519 keypair and saves the private key seed into
-   * the OS Keystore/Keychain protected with biometric/passcode access control.
+   * Generates a new hardware-backed ECDSA P-256 keypair.
+   * If isStaging is true, generates into a provisional staging slot to protect
+   * any active working key from premature destruction during replacement.
    */
   public static async generateAndStoreDeviceKey(
     accountId: string,
-    _promptTitle = 'Secure Device Enrolment',
-  ): Promise<{ publicKeyBase64: string }> {
-    const service = this.getServiceKey(accountId);
+    isStaging = false,
+  ): Promise<DeviceKeyMetadata> {
+    return DeviceSecurityService.generateDeviceKey(accountId, isStaging);
+  }
 
-    // 1. Generate 32-byte cryptographically secure private key seed
-    const privKeyBytes = ed25519.utils.randomSecretKey();
-    const pubKeyBytes = ed25519.getPublicKey(privKeyBytes);
+  /**
+   * Commit staging key to active status after backend registration succeeds.
+   */
+  public static async commitStagingKey(accountId: string): Promise<void> {
+    await DeviceSecurityService.commitStagingKey(accountId);
+  }
 
-    const privKeyHex = Buffer.from(privKeyBytes).toString('hex');
-    const publicKeyBase64 = Buffer.from(pubKeyBytes).toString('base64');
-
-    const payload = JSON.stringify({
-      privKeyHex,
-      publicKeyBase64,
-      accountId,
-      createdAt: new Date().toISOString(),
-    });
-
-    // 2. Determine best access control for device
-    const caps = await LocalApprovalService.checkCapabilities();
-    let accessControl: Keychain.ACCESS_CONTROL = Keychain.ACCESS_CONTROL.DEVICE_PASSCODE;
-
-    if (caps.capability === 'BIOMETRICS_AVAILABLE') {
-      accessControl = Keychain.ACCESS_CONTROL.BIOMETRY_ANY_OR_DEVICE_PASSCODE;
-    }
-
-    try {
-      await Keychain.setGenericPassword(accountId, payload, {
-        service,
-        accessControl,
-        securityLevel: Keychain.SECURITY_LEVEL.SECURE_HARDWARE,
-        accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-      });
-
-      DiagnosticLogger.info('SIGNER', 'Device signing key stored securely in Keychain', {
-        accountId,
-        accessControl,
-      });
-
-      return { publicKeyBase64 };
-    } catch (err: unknown) {
-      // Fallback without biometric constraint if device lacks biometric/passcode hardware
-      DiagnosticLogger.warn('SIGNER', 'Secure hardware store fallback', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-
-      await Keychain.setGenericPassword(accountId, payload, {
-        service,
-        accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-      });
-
-      return { publicKeyBase64 };
-    }
+  /**
+   * Discard staging key if backend activation fails.
+   */
+  public static async discardStagingKey(accountId: string): Promise<void> {
+    await DeviceSecurityService.discardStagingKey(accountId);
   }
 
   /**
    * Check if a device signing key is enrolled for this account.
    */
   public static async hasEnrolledDeviceKey(accountId: string): Promise<boolean> {
-    const service = this.getServiceKey(accountId);
-    try {
-      const exists = await Keychain.hasGenericPassword({ service });
-      return exists;
-    } catch {
-      return false;
-    }
+    return DeviceSecurityService.hasActiveKey(accountId);
   }
 
   /**
    * Delete device signing key upon explicit revocation or account removal.
    */
   public static async clearDeviceKey(accountId: string): Promise<void> {
-    const service = this.getServiceKey(accountId);
-    try {
-      await Keychain.resetGenericPassword({ service });
-      DiagnosticLogger.info('SIGNER', 'Cleared device signing key', { accountId });
-    } catch (err: unknown) {
-      DiagnosticLogger.warn('SIGNER', 'Failed clearing device key', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    await DeviceSecurityService.deleteKey(accountId);
   }
 
   /**
    * Builds canonical message to sign for attendance transaction.
-   * Format: v1|{terminal_id}|{session_id}|{challenge}|{student_id}|{matric_number}|{timestamp}|{event_id}
+   * Format: v1|submission|{event_id}|{credential_id}|{credential_version}|{algorithm}|{student_id}|{matric_number}|{terminal_id}|{session_id}|{challenge}|{timestamp}|{timestamp_source}
    */
-  public static buildCanonicalMessage(params: SignAttendanceParams): string {
-    return [
-      'v1',
-      params.terminalId,
-      params.sessionId,
-      params.challengeBase64,
-      params.studentId,
-      params.matricNumber,
-      params.timestamp.toString(),
-      params.eventId,
-    ].join('|');
+  public static buildCanonicalMessage(
+    params: SignAttendanceParams,
+    credentialId: string,
+  ): string {
+    return AttendanceProtocol.buildSubmissionCanonicalString({
+      version: 1,
+      event_id: params.eventId,
+      credential_id: credentialId,
+      credential_version: DeviceSecurityService.CREDENTIAL_VERSION,
+      algorithm: DeviceSecurityService.ALGORITHM,
+      student_id: params.studentId,
+      matric_number: params.matricNumber,
+      terminal_id: params.terminalId,
+      session_id: params.sessionId,
+      challenge: params.challengeBase64,
+      timestamp: params.timestamp,
+      timestamp_source: 'phone_os',
+    });
   }
 
   /**
-   * Request OS authentication (biometric / passcode) to access key,
+   * Request OS authentication (biometric / PIN) to unlock key,
    * then sign the canonical attendance challenge.
    */
   public static async signAttendance(
     params: SignAttendanceParams,
-    authPrompt = 'Authenticate to confirm attendance check-in',
+    authPrompt = 'Authenticate with biometric or PIN to confirm attendance check-in',
   ): Promise<SignAttendanceResult> {
-    const service = this.getServiceKey(params.accountId);
-
-    let creds: false | Keychain.UserCredentials;
-    try {
-      creds = await Keychain.getGenericPassword({
-        service,
-        authenticationPrompt: {
-          title: 'Authorise Attendance Check-in',
-          subtitle: authPrompt,
-          description: `Signing attendance for ${params.matricNumber} at terminal ${params.terminalId}`,
-        },
-      });
-    } catch (authError: unknown) {
-      const classified = LocalApprovalService.classifyAuthError(authError);
-      DiagnosticLogger.logError(params.eventId, 'SIGN_AUTH', classified.code, classified.message);
-      return {
-        success: false,
-        errorCode: classified.code,
-        errorMessage: classified.message,
-      };
-    }
-
-    if (!creds || !creds.password) {
+    const hasKey = await DeviceSecurityService.hasActiveKey(params.accountId);
+    if (!hasKey) {
       DiagnosticLogger.logError(params.eventId, 'SIGN_KEY', 'KEY_NOT_FOUND', 'Device key not found');
       return {
         success: false,
@@ -180,50 +111,59 @@ export class AttendanceSigner {
       };
     }
 
-    try {
-      const record = JSON.parse(creds.password);
-      const privKeyBytes = Buffer.from(record.privKeyHex, 'hex');
-      const canonicalMsg = this.buildCanonicalMessage(params);
-      const msgBytes = Buffer.from(canonicalMsg, 'utf-8');
+    const pubKey = await DeviceSecurityService.getActivePublicKey(params.accountId);
+    const credentialId = pubKey
+      ? DeviceSecurityService.computeCredentialId(pubKey)
+      : params.credentialId || 'cred_unknown';
 
-      // Ed25519 signing
-      const sigBytes = ed25519.sign(msgBytes, privKeyBytes);
-      const signatureBase64 = Buffer.from(sigBytes).toString('base64');
+    const canonicalMsg = this.buildCanonicalMessage(params, credentialId);
 
-      DiagnosticLogger.logStage(params.eventId, 'SIGN_SUCCESS', 'Transaction signed successfully');
+    const signRes = await DeviceSecurityService.signData(
+      params.accountId,
+      canonicalMsg,
+      'Authorise Attendance Check-in',
+      authPrompt,
+    );
 
-      return {
-        success: true,
-        signatureBase64,
-        publicKeyBase64: record.publicKeyBase64,
-        canonicalMessage: canonicalMsg,
-      };
-    } catch (signErr: unknown) {
-      const msg = signErr instanceof Error ? signErr.message : String(signErr);
-      DiagnosticLogger.logError(params.eventId, 'SIGN_EXEC', 'SIGNING_FAILED', msg);
+    if (!signRes.success || !signRes.signatureDerBase64) {
+      DiagnosticLogger.logError(
+        params.eventId,
+        'SIGN_AUTH',
+        signRes.errorCode || 'SIGNING_FAILED',
+        signRes.errorMessage || 'Signing failed or was cancelled',
+      );
       return {
         success: false,
-        errorCode: 'SIGNING_FAILED',
-        errorMessage: `Failed to generate digital signature: ${msg}`,
+        errorCode: signRes.errorCode,
+        errorMessage: signRes.errorMessage,
       };
     }
+
+    DiagnosticLogger.logStage(params.eventId, 'SIGN_SUCCESS', 'Transaction signed successfully', {
+      algorithm: signRes.algorithm,
+      securityLevel: signRes.securityLevel,
+    });
+
+    return {
+      success: true,
+      signatureBase64: signRes.signatureDerBase64,
+      publicKeyBase64: pubKey || undefined,
+      credentialId,
+      credentialVersion: DeviceSecurityService.CREDENTIAL_VERSION,
+      algorithm: DeviceSecurityService.ALGORITHM,
+      canonicalMessage: canonicalMsg,
+      securityLevel: signRes.securityLevel,
+    };
   }
 
   /**
-   * Utility to verify Ed25519 signature
+   * Utility to verify ECDSA P-256 signature
    */
   public static verifySignature(
     canonicalMessage: string,
     signatureBase64: string,
     publicKeyBase64: string,
   ): boolean {
-    try {
-      const msgBytes = Buffer.from(canonicalMessage, 'utf-8');
-      const sigBytes = Buffer.from(signatureBase64, 'base64');
-      const pubBytes = Buffer.from(publicKeyBase64, 'base64');
-      return ed25519.verify(sigBytes, msgBytes, pubBytes);
-    } catch {
-      return false;
-    }
+    return DeviceSecurityService.verifySignature(canonicalMessage, signatureBase64, publicKeyBase64);
   }
 }

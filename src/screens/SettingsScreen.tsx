@@ -13,10 +13,11 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
+import { DiagnosticLogger } from '../services/DiagnosticLogger';
 import { T } from '../theme/tokens';
 
 export default function SettingsScreen({ navigation }: any) {
-  const { account, signOut } = useAuth();
+  const { account, authStatus, isDeviceEnrolled, enrollDeviceWithCode, signOut } = useAuth();
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -24,6 +25,37 @@ export default function SettingsScreen({ navigation }: any) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+
+  // Device enrolment state
+  const [activationCode, setActivationCode] = useState('');
+  const [enrollingDevice, setEnrollingDevice] = useState(false);
+  const [enrollError, setEnrollError] = useState<string | null>(null);
+  const [enrollSuccess, setEnrollSuccess] = useState(false);
+
+  // Diagnostics view
+  const [showLogs, setShowLogs] = useState(false);
+
+  const handleEnrollDevice = async () => {
+    setEnrollError(null);
+    setEnrollSuccess(false);
+
+    if (!activationCode.trim()) {
+      setEnrollError('Please enter the activation code provided by your administrator.');
+      return;
+    }
+
+    setEnrollingDevice(true);
+    const result = await enrollDeviceWithCode(activationCode);
+    setEnrollingDevice(false);
+
+    if (result.error) {
+      setEnrollError(result.error);
+    } else {
+      setEnrollSuccess(true);
+      setActivationCode('');
+      Alert.alert('Device Authorised', 'Your phone has been bound to your account and is authorised for attendance.');
+    }
+  };
 
   const handleChangePassword = async () => {
     setError(null);
@@ -52,16 +84,16 @@ export default function SettingsScreen({ navigation }: any) {
 
       if (rpcErr) throw rpcErr;
 
-      const res = data as any;
-      if (!res.ok) throw new Error(res.error || 'Failed to change password.');
+      const res = data as Record<string, unknown> | null;
+      if (!res?.ok) throw new Error((res?.error as string) || 'Failed to change password.');
 
       setSuccess(true);
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
       Alert.alert('Success', 'Your password has been changed.');
-    } catch (err: any) {
-      setError(err.message || 'An unexpected error occurred.');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'An unexpected error occurred.');
     } finally {
       setLoading(false);
     }
@@ -83,22 +115,90 @@ export default function SettingsScreen({ navigation }: any) {
         <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
           <Text style={styles.backArrow}>←</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Settings</Text>
+        <Text style={styles.headerTitle}>Settings & Device</Text>
       </View>
 
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
-
-        {/* Account info pill */}
+        {/* Account info card */}
         <View style={styles.accountCard}>
           <View style={styles.avatar}>
             <Text style={styles.avatarInitial}>
               {account?.full_name?.[0]?.toUpperCase() ?? '?'}
             </Text>
           </View>
-          <View>
+          <View style={styles.accountDetails}>
             <Text style={styles.accountName}>{account?.full_name}</Text>
             <Text style={styles.accountRole}>{account?.role}</Text>
+            <View style={styles.statusBadge}>
+              <Text style={styles.statusBadgeText}>
+                {authStatus === 'ONLINE_AUTHENTICATED' && '🟢 Online'}
+                {authStatus === 'OFFLINE_AUTHORISED' && '🟡 Authorised Offline'}
+                {authStatus === 'CREDENTIAL_EXPIRED_OR_REVOKED' && '🔴 Re-auth Required'}
+                {authStatus === 'SIGNED_OUT' && '⚪ Signed Out'}
+              </Text>
+            </View>
           </View>
+        </View>
+
+        {/* Device Enrolment Section */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Device Enrolment</Text>
+          <Text style={styles.sectionSubtitle}>
+            Attendance terminal checks require an authorised phone signing key.
+          </Text>
+
+          <View style={styles.enrolmentStatusRow}>
+            <Text style={styles.enrolmentLabel}>Device Status:</Text>
+            <Text
+              style={[
+                styles.enrolmentValue,
+                { color: isDeviceEnrolled ? T.colors.success : T.colors.warning },
+              ]}
+            >
+              {isDeviceEnrolled ? '✓ Authorised Device' : '⚠️ Not Enrolled'}
+            </Text>
+          </View>
+
+          {enrollError ? (
+            <View style={styles.errorBox}>
+              <Text style={styles.errorText}>{enrollError}</Text>
+            </View>
+          ) : null}
+
+          {enrollSuccess ? (
+            <View style={styles.successBox}>
+              <Text style={styles.successText}>Device successfully registered and bound!</Text>
+            </View>
+          ) : null}
+
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Admin Activation Code</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="e.g. ACT-8ABC23"
+              placeholderTextColor={T.colors.inputPlaceholder}
+              value={activationCode}
+              onChangeText={setActivationCode}
+              autoCapitalize="characters"
+            />
+            <Text style={styles.helperText}>
+              Codes are single-use and short-lived. Contact your lecturer or system admin to obtain one.
+            </Text>
+          </View>
+
+          <TouchableOpacity
+            style={[styles.primaryBtn, enrollingDevice && styles.disabledBtn]}
+            onPress={handleEnrollDevice}
+            disabled={enrollingDevice}
+          >
+            {enrollingDevice ? (
+              <ActivityIndicator color="#fff" size="small" />
+            ) : (
+              <Text style={styles.primaryBtnText}>
+                {isDeviceEnrolled ? 'Replace Device Credential' : 'Enrol This Phone'}
+              </Text>
+            )}
+          </TouchableOpacity>
         </View>
 
         {/* Change Password */}
@@ -130,47 +230,58 @@ export default function SettingsScreen({ navigation }: any) {
                 placeholderTextColor={T.colors.inputPlaceholder}
                 value={value}
                 onChangeText={setter}
-                // ── Fix: explicit text color prevents invisible text ──
-                
               />
             </View>
           ))}
 
           <TouchableOpacity
-            style={[styles.primaryBtn, loading && styles.disabledBtn]}
+            style={[styles.outlineBtn, loading && styles.disabledBtn]}
             onPress={handleChangePassword}
             disabled={loading}
-            activeOpacity={0.85}
           >
             {loading ? (
-              <ActivityIndicator color="#fff" />
+              <ActivityIndicator color={T.colors.primary} size="small" />
             ) : (
-              <Text style={styles.primaryBtnText}>Update Password</Text>
+              <Text style={styles.outlineBtnText}>Update Password</Text>
             )}
           </TouchableOpacity>
         </View>
 
-        {/* Face Recognition */}
+        {/* Diagnostic Logs */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Face Recognition</Text>
-          <Text style={styles.helperText}>
-            If you're having trouble checking in, you can re-enroll your face data.
-          </Text>
           <TouchableOpacity
-            style={styles.outlineBtn}
-            onPress={() => navigation.navigate('EnrollFace')}
-            activeOpacity={0.8}
+            style={styles.logsToggleRow}
+            onPress={() => setShowLogs(!showLogs)}
           >
-            <Text style={styles.outlineBtnText}>Re-enroll Face</Text>
+            <Text style={styles.sectionTitle}>Diagnostic Logs</Text>
+            <Text style={styles.logsToggleText}>{showLogs ? 'Hide' : 'Show'}</Text>
           </TouchableOpacity>
+
+          {showLogs && (
+            <View style={styles.logsContainer}>
+              {DiagnosticLogger.getRecentLogs().length === 0 ? (
+                <Text style={styles.emptyLogsText}>No diagnostic logs recorded yet.</Text>
+              ) : (
+                DiagnosticLogger.getRecentLogs()
+                  .slice(-10)
+                  .map((log) => (
+                    <View key={log.id} style={styles.logItem}>
+                      <Text style={styles.logMeta}>
+                        [{log.timestamp.substring(11, 19)}] {log.stage}
+                        {log.durationMs ? ` (${log.durationMs}ms)` : ''}
+                      </Text>
+                      <Text style={styles.logMsg}>{log.message}</Text>
+                    </View>
+                  ))
+              )}
+            </View>
+          )}
         </View>
 
         {/* Log Out */}
-        <TouchableOpacity style={styles.dangerBtn} onPress={handleLogOut} activeOpacity={0.8}>
-          <Text style={styles.dangerBtnText}>Log Out</Text>
+        <TouchableOpacity style={styles.logoutBtn} onPress={handleLogOut}>
+          <Text style={styles.logoutBtnText}>Log Out</Text>
         </TouchableOpacity>
-
-        <View style={{ height: T.spacing.xxl }} />
       </ScrollView>
     </SafeAreaView>
   );
@@ -184,52 +295,56 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: T.colors.surface,
-    paddingHorizontal: T.spacing.md,
+    paddingHorizontal: T.spacing.lg,
     paddingVertical: T.spacing.md,
+    backgroundColor: T.colors.surface,
     borderBottomWidth: 1,
     borderBottomColor: T.colors.border,
   },
   backBtn: {
-    padding: T.spacing.sm,
-    marginRight: T.spacing.sm,
+    marginRight: T.spacing.md,
+    padding: T.spacing.xs,
   },
   backArrow: {
     fontSize: T.fontSize.xl,
-    color: T.colors.primary,
-    fontWeight: '700',
+    color: T.colors.text,
   },
   headerTitle: {
-    fontSize: T.fontSize.xl,
+    fontSize: T.fontSize.lg,
     fontWeight: '700',
     color: T.colors.text,
   },
-  scroll: { flex: 1 },
+  scroll: {
+    flex: 1,
+  },
   scrollContent: {
-    padding: T.spacing.md,
-    gap: T.spacing.md,
+    padding: T.spacing.lg,
+    gap: T.spacing.lg,
   },
   accountCard: {
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: T.colors.surface,
+    padding: T.spacing.lg,
     borderRadius: T.radius.lg,
-    padding: T.spacing.md,
-    gap: T.spacing.md,
     ...T.shadow.sm,
   },
   avatar: {
     width: 48,
     height: 48,
-    borderRadius: T.radius.full,
-    backgroundColor: T.colors.primary100,
+    borderRadius: 24,
+    backgroundColor: T.colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
+    marginRight: T.spacing.md,
   },
   avatarInitial: {
+    color: '#fff',
     fontSize: T.fontSize.xl,
     fontWeight: '700',
-    color: T.colors.primary600,
+  },
+  accountDetails: {
+    flex: 1,
   },
   accountName: {
     fontSize: T.fontSize.base,
@@ -237,22 +352,51 @@ const styles = StyleSheet.create({
     color: T.colors.text,
   },
   accountRole: {
-    fontSize: T.fontSize.sm,
+    fontSize: T.fontSize.xs,
     color: T.colors.textSecondary,
     textTransform: 'capitalize',
     marginTop: 2,
   },
+  statusBadge: {
+    marginTop: 4,
+  },
+  statusBadgeText: {
+    fontSize: T.fontSize.xs,
+    color: T.colors.textSecondary,
+  },
   section: {
     backgroundColor: T.colors.surface,
+    padding: T.spacing.lg,
     borderRadius: T.radius.lg,
-    padding: T.spacing.md,
     ...T.shadow.sm,
   },
   sectionTitle: {
-    fontSize: T.fontSize.lg,
+    fontSize: T.fontSize.base,
     fontWeight: '700',
     color: T.colors.text,
+    marginBottom: 4,
+  },
+  sectionSubtitle: {
+    fontSize: T.fontSize.xs,
+    color: T.colors.textSecondary,
     marginBottom: T.spacing.md,
+  },
+  enrolmentStatusRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: T.spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: T.colors.border,
+    marginBottom: T.spacing.md,
+  },
+  enrolmentLabel: {
+    fontSize: T.fontSize.sm,
+    color: T.colors.textSecondary,
+    fontWeight: '500',
+  },
+  enrolmentValue: {
+    fontSize: T.fontSize.sm,
+    fontWeight: '700',
   },
   fieldGroup: {
     marginBottom: T.spacing.md,
@@ -260,7 +404,7 @@ const styles = StyleSheet.create({
   label: {
     fontSize: T.fontSize.sm,
     fontWeight: '600',
-    color: T.colors.textSecondary,
+    color: T.colors.text,
     marginBottom: 6,
   },
   input: {
@@ -269,61 +413,110 @@ const styles = StyleSheet.create({
     borderColor: T.colors.inputBorder,
     borderRadius: T.radius.md,
     paddingHorizontal: T.spacing.md,
-    paddingVertical: T.spacing.sm + 4,
-    fontSize: T.fontSize.base,
-    // ── Fix: explicit text color ──
-    color: T.colors.inputText,
+    paddingVertical: 10,
+    fontSize: T.fontSize.sm,
+    color: T.colors.text,
   },
   helperText: {
-    fontSize: T.fontSize.sm,
-    color: T.colors.textSecondary,
-    marginBottom: T.spacing.md,
-    lineHeight: 20,
+    fontSize: T.fontSize.xs,
+    color: T.colors.textMuted,
+    marginTop: 4,
   },
   errorBox: {
     backgroundColor: T.colors.errorBg,
     borderRadius: T.radius.md,
-    padding: T.spacing.sm + 4,
+    padding: T.spacing.md,
     marginBottom: T.spacing.md,
-    borderWidth: 1,
-    borderColor: '#fecdd3',
   },
-  errorText: { color: T.colors.error, fontSize: T.fontSize.sm, fontWeight: '500' },
+  errorText: {
+    color: T.colors.error,
+    fontSize: T.fontSize.xs,
+  },
   successBox: {
-    backgroundColor: T.colors.successBg,
+    backgroundColor: '#ecfdf5',
     borderRadius: T.radius.md,
-    padding: T.spacing.sm + 4,
+    padding: T.spacing.md,
     marginBottom: T.spacing.md,
-    borderWidth: 1,
-    borderColor: '#6ee7b7',
   },
-  successText: { color: T.colors.success, fontSize: T.fontSize.sm, fontWeight: '500' },
+  successText: {
+    color: '#059669',
+    fontSize: T.fontSize.xs,
+  },
   primaryBtn: {
     backgroundColor: T.colors.primary,
+    paddingVertical: 12,
     borderRadius: T.radius.md,
-    paddingVertical: T.spacing.md,
     alignItems: 'center',
-    ...T.shadow.md,
-    shadowColor: T.colors.primary,
+    marginTop: 4,
   },
-  disabledBtn: { opacity: 0.6 },
-  primaryBtnText: { color: '#fff', fontSize: T.fontSize.base, fontWeight: '700' },
+  primaryBtnText: {
+    color: '#fff',
+    fontSize: T.fontSize.sm,
+    fontWeight: '700',
+  },
   outlineBtn: {
-    borderWidth: 1.5,
-    borderColor: T.colors.primary,
-    borderRadius: T.radius.md,
-    paddingVertical: T.spacing.md,
-    alignItems: 'center',
-  },
-  outlineBtnText: { color: T.colors.primary, fontSize: T.fontSize.base, fontWeight: '700' },
-  dangerBtn: {
-    backgroundColor: T.colors.errorBg,
     borderWidth: 1,
-    borderColor: '#fecdd3',
-    borderRadius: T.radius.lg,
-    paddingVertical: T.spacing.md,
+    borderColor: T.colors.primary,
+    paddingVertical: 12,
+    borderRadius: T.radius.md,
     alignItems: 'center',
-    ...T.shadow.sm,
+    marginTop: 4,
   },
-  dangerBtnText: { color: T.colors.error, fontSize: T.fontSize.base, fontWeight: '700' },
+  outlineBtnText: {
+    color: T.colors.primary,
+    fontSize: T.fontSize.sm,
+    fontWeight: '700',
+  },
+  disabledBtn: {
+    opacity: 0.6,
+  },
+  logsToggleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  logsToggleText: {
+    fontSize: T.fontSize.xs,
+    color: T.colors.primary,
+    fontWeight: '600',
+  },
+  logsContainer: {
+    marginTop: T.spacing.md,
+    backgroundColor: T.colors.bg,
+    padding: T.spacing.sm,
+    borderRadius: T.radius.md,
+  },
+  emptyLogsText: {
+    fontSize: T.fontSize.xs,
+    color: T.colors.textMuted,
+    textAlign: 'center',
+    paddingVertical: T.spacing.sm,
+  },
+  logItem: {
+    paddingVertical: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: T.colors.border,
+  },
+  logMeta: {
+    fontSize: 10,
+    color: T.colors.textMuted,
+    fontWeight: '600',
+  },
+  logMsg: {
+    fontSize: 11,
+    color: T.colors.text,
+  },
+  logoutBtn: {
+    backgroundColor: '#fee2e2',
+    paddingVertical: 14,
+    borderRadius: T.radius.lg,
+    alignItems: 'center',
+    marginTop: T.spacing.sm,
+    marginBottom: T.spacing.xxl,
+  },
+  logoutBtnText: {
+    color: '#dc2626',
+    fontSize: T.fontSize.base,
+    fontWeight: '700',
+  },
 });

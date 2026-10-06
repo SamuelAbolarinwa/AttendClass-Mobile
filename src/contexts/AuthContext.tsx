@@ -111,8 +111,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           });
 
           if (error) {
-            // Check if error is due to network failure vs backend database rejection
-            if (isNetworkError(error)) {
+            // Check if error is due to network failure, gateway, or timeout vs backend database rejection
+            const errMsg = (error.message || '').toLowerCase();
+            const isGatewayOrTransient =
+              errMsg.includes('502') ||
+              errMsg.includes('503') ||
+              errMsg.includes('504') ||
+              errMsg.includes('bad gateway') ||
+              errMsg.includes('gateway timeout') ||
+              errMsg.includes('connection refused') ||
+              isNetworkError(error);
+
+            if (isGatewayOrTransient) {
               throw error; // Let outer network catch handle offline policy
             }
 
@@ -328,37 +338,47 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       setLoading(true);
       try {
-        // 1. Generate new Ed25519 signing keypair in hardware-backed storage
-        const { publicKeyBase64 } = await AttendanceSigner.generateAndStoreDeviceKey(account.id);
+        // 1. Generate new ECDSA P-256 signing key in provisional staging slot
+        // Does NOT overwrite or delete any existing working active key
+        const keyMetadata = await AttendanceSigner.generateAndStoreDeviceKey(account.id, true);
 
         // 2. Call backend RPC to validate one-time activation code and bind public key
         const { data, error } = await supabase.rpc('platform_enroll_device', {
           p_token: account.token,
           p_activation_code: activationCode.trim().toUpperCase(),
-          p_device_public_key: publicKeyBase64,
+          p_device_public_key: keyMetadata.publicKeyDerBase64,
           p_platform: Platform.OS,
           p_device_name: deviceName || (Platform.OS === 'android' ? 'Android Device' : 'iOS Device'),
         });
 
         if (error) {
+          // Discard staging key on error without affecting active key
+          await AttendanceSigner.discardStagingKey(account.id);
           setLoading(false);
           return { error: error.message };
         }
 
         const res = data as { ok?: boolean; error?: string } | null;
         if (!res || !res.ok) {
+          // Discard staging key on business logic error without affecting active key
+          await AttendanceSigner.discardStagingKey(account.id);
           setLoading(false);
           return { error: res?.error || 'Device enrolment failed.' };
         }
 
+        // 3. Backend validated code and registered device: commit staging key to active
+        await AttendanceSigner.commitStagingKey(account.id);
         setIsDeviceEnrolled(true);
+
         DiagnosticLogger.info('AUTH', 'Device successfully enrolled with admin activation code', {
           accountId: account.id,
+          securityLevel: keyMetadata.securityLevel,
         });
 
         setLoading(false);
         return { error: null };
       } catch (err: unknown) {
+        await AttendanceSigner.discardStagingKey(account.id).catch(() => {});
         setLoading(false);
         const msg = err instanceof Error ? err.message : 'Error during device enrolment';
         return { error: msg };

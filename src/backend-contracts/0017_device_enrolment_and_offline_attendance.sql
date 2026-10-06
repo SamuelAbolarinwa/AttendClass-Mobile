@@ -31,6 +31,9 @@ ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS device_name text;
 ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS device_fingerprint text;
 ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
 ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS revocation_reason text;
+ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS algorithm text NOT NULL DEFAULT 'ECDSA_P256_SHA256';
+ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS credential_id text;
+ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS credential_version text DEFAULT 'v1';
 
 CREATE INDEX IF NOT EXISTS idx_student_devices_student_active ON student_devices(student_id) WHERE revoked_at IS NULL;
 
@@ -38,6 +41,10 @@ CREATE INDEX IF NOT EXISTS idx_student_devices_student_active ON student_devices
 ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS event_id uuid UNIQUE;
 ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS terminal_id text;
 ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS terminal_saved_at timestamptz;
+ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS phone_attendance_time timestamptz;
+ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS timestamp_source text DEFAULT 'phone_os';
+ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS terminal_receipt_sig text;
+ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS submission_digest text;
 ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS offline_verified boolean DEFAULT false;
 
 -- ── 4. Helper function to generate random alphanumeric code ─────────────────
@@ -127,7 +134,9 @@ CREATE OR REPLACE FUNCTION platform_enroll_device(
   p_activation_code text,
   p_device_public_key text,
   p_platform text,
-  p_device_name text DEFAULT 'Mobile Device'
+  p_device_name text DEFAULT 'Mobile Device',
+  p_algorithm text DEFAULT 'ECDSA_P256_SHA256',
+  p_credential_id text DEFAULT NULL
 )
 RETURNS jsonb AS $$
 DECLARE
@@ -148,12 +157,12 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'error', 'Account not found');
   END IF;
 
-  IF p_activation_code IS NULL OR trim(p_activation_code) = '' THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'Activation code is required');
+  IF p_activation_code IS NULL OR length(trim(p_activation_code)) != 8 THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Invalid activation code format (expected 8 alphanumeric characters)');
   END IF;
 
-  IF p_device_public_key IS NULL OR length(trim(p_device_public_key)) < 32 THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'Invalid device public key');
+  IF p_device_public_key IS NULL OR length(trim(p_device_public_key)) < 64 OR length(trim(p_device_public_key)) > 512 THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Invalid device public key length');
   END IF;
 
   _incoming_hash := encode(digest(upper(trim(p_activation_code)), 'sha256'), 'hex');
@@ -205,16 +214,22 @@ BEGIN
   WHERE account_id = _student.id
     AND token != p_token;
 
-  -- Register new authorized device
+  -- Register new authorized device with verified algorithm and credential metadata
   INSERT INTO student_devices (
     student_id,
     device_public_key,
+    algorithm,
+    credential_id,
+    credential_version,
     platform,
     device_name,
     enrolled_at
   ) VALUES (
     _student.id,
     p_device_public_key,
+    COALESCE(p_algorithm, 'ECDSA_P256_SHA256'),
+    COALESCE(p_credential_id, encode(digest(p_device_public_key, 'sha256'), 'hex')),
+    'v1',
     COALESCE(p_platform, 'android'),
     COALESCE(p_device_name, 'Mobile Device'),
     now()

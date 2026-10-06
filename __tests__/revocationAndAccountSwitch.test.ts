@@ -14,7 +14,7 @@ describe('Revocation & Account Switching Isolation', () => {
 
     // Enroll device key for Student A
     const keyA = await AttendanceSigner.generateAndStoreDeviceKey(studentA);
-    expect(keyA.publicKeyBase64).toBeDefined();
+    expect(keyA.publicKeyDerBase64).toBeDefined();
 
     // Check device key status
     expect(await AttendanceSigner.hasEnrolledDeviceKey(studentA)).toBe(true);
@@ -29,6 +29,7 @@ describe('Revocation & Account Switching Isolation', () => {
       terminalId: 'TERM_01',
       sessionId: 'sess_1',
       attendanceTimestamp: Math.floor(Date.now() / 1000),
+      phoneTimeConfidence: 'provisional',
       attendanceTimeIso: new Date().toISOString(),
       localReceiptTimeIso: new Date().toISOString(),
       status: 'DEVICE_CONFIRMED',

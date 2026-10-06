@@ -54,6 +54,9 @@ describe('BLE Protocol & Transaction Validation', () => {
     const submission = {
       version: 1,
       event_id: 'evt-100',
+      credential_id: 'cred-test-1',
+      credential_version: 'v1',
+      algorithm: 'ECDSA_P256_SHA256' as const,
       student_id: 'std-200',
       matric_number: '2021/1/12345CP',
       terminal_id: 'TERM_01',

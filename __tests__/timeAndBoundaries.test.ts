@@ -29,6 +29,7 @@ describe('Time Provenance & Lagos Calendar Boundaries', () => {
       terminalId: 'TERM_01',
       sessionId: 'sess_1',
       attendanceTimestamp: 1791298800,
+      phoneTimeConfidence: 'provisional',
       attendanceTimeIso: new Date().toISOString(),
       localReceiptTimeIso: new Date().toISOString(),
       status: 'DEVICE_CONFIRMED',

@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+      - feat/attendclass-offline-ble-terminal
   pull_request:
     branches:
       - main
+      - feat/attendclass-offline-ble-terminal
   workflow_dispatch:
 
 jobs:

@@ -1,3 +1,4 @@
+/* eslint-disable no-bitwise */
 import { Buffer } from 'buffer';
 
 export const ATTENDCLASS_SERVICE_UUID = '0000ff10-0000-1000-8000-00805f9b34fb';
@@ -6,12 +7,17 @@ export const SUBMISSION_CHAR_UUID = '0000ff12-0000-1000-8000-00805f9b34fb';
 export const ACK_CHAR_UUID = '0000ff13-0000-1000-8000-00805f9b34fb';
 
 export const PROTOCOL_VERSION = 1;
+export const MIN_SUPPORTED_MTU = 23;
+export const MIN_ATT_PAYLOAD = 20; // 23 - 3 bytes ATT header
+export const FRAME_MAGIC_BYTE = 0xac;
+export const FRAME_VERSION_BYTE = 0x01;
+export const BINARY_HEADER_SIZE = 6;
 
 export interface TerminalChallengePayload {
   version: number;
   terminal_id: string;
   session_id: string;
-  challenge: string; // Base64 unpredictable 32-byte nonce
+  challenge: string; // Base64 unpredictable nonce (>= 16 bytes)
   terminal_time: number;
   time_confidence: 'rtc' | 'unsynchronized' | 'estimated';
   course_code?: string;
@@ -32,7 +38,7 @@ export interface AttendanceSubmissionPayload {
   timestamp: number;
   timestamp_source: 'phone_os' | 'terminal_sync';
   public_key: string; // SPKI DER Base64
-  signature: string; // ECDSA P-256 DER Base64
+  signature: string; // ECDSA P-256 DER or P1363 Base64
 }
 
 export interface TerminalAckPayload {
@@ -45,20 +51,34 @@ export interface TerminalAckPayload {
   sd_persisted: boolean;
   record_index?: number;
   saved_at?: number;
-  signature?: string; // Terminal ECDSA P-256 DER Base64
+  signature?: string; // Terminal ECDSA P-256 signature
   error_code?: string | null;
 }
 
 export interface BleFramePacket {
-  txId: string;
+  txId: number;
   seq: number;
   total: number;
-  chunk: string;
+  chunk: Uint8Array;
 }
 
 export class AttendanceProtocol {
   public static readonly MAX_PAYLOAD_BYTES = 4096;
-  public static readonly DEFAULT_CHUNK_SIZE = 100; // Fits well within typical negotiated MTU
+
+  /**
+   * Validate that a field value does not contain delimiter characters or invalid control codes.
+   */
+  public static validateField(fieldName: string, value: string, maxLen = 256): void {
+    if (typeof value !== 'string') {
+      throw new Error(`INVALID_FIELD_TYPE: Field ${fieldName} must be a string`);
+    }
+    if (value.length > maxLen) {
+      throw new Error(`FIELD_TOO_LONG: Field ${fieldName} exceeds maximum length of ${maxLen}`);
+    }
+    if (value.includes('|') || value.includes('\n') || value.includes('\r')) {
+      throw new Error(`INVALID_FIELD_DELIMITER: Field ${fieldName} cannot contain pipe '|' or newline characters`);
+    }
+  }
 
   /**
    * Build canonical string for student attendance submission.
@@ -67,6 +87,17 @@ export class AttendanceProtocol {
   public static buildSubmissionCanonicalString(
     params: Omit<AttendanceSubmissionPayload, 'public_key' | 'signature'>,
   ): string {
+    this.validateField('event_id', params.event_id);
+    this.validateField('credential_id', params.credential_id);
+    this.validateField('credential_version', params.credential_version);
+    this.validateField('algorithm', params.algorithm);
+    this.validateField('student_id', params.student_id);
+    this.validateField('matric_number', params.matric_number);
+    this.validateField('terminal_id', params.terminal_id);
+    this.validateField('session_id', params.session_id);
+    this.validateField('challenge', params.challenge);
+    this.validateField('timestamp_source', params.timestamp_source);
+
     return [
       'v1',
       'submission',
@@ -85,7 +116,7 @@ export class AttendanceProtocol {
   }
 
   /**
-   * Parse and validate terminal challenge packet from raw string or base64.
+   * Parse and validate terminal challenge packet from raw string, JSON, or Base64.
    */
   public static parseChallenge(raw: string): TerminalChallengePayload {
     let json: unknown;
@@ -113,14 +144,17 @@ export class AttendanceProtocol {
     if (!obj.terminal_id || typeof obj.terminal_id !== 'string') {
       throw new Error('MALFORMED_CHALLENGE_PACKET: Missing or invalid terminal_id');
     }
+    this.validateField('terminal_id', obj.terminal_id);
 
     if (!obj.session_id || typeof obj.session_id !== 'string') {
       throw new Error('MALFORMED_CHALLENGE_PACKET: Missing or invalid session_id');
     }
+    this.validateField('session_id', obj.session_id);
 
     if (!obj.challenge || typeof obj.challenge !== 'string' || obj.challenge.length < 16) {
       throw new Error('MALFORMED_CHALLENGE_PACKET: Challenge is missing or too short (replay protection compromised)');
     }
+    this.validateField('challenge', obj.challenge);
 
     const timeConfidence =
       obj.time_confidence === 'rtc' || obj.time_confidence === 'estimated'
@@ -203,58 +237,107 @@ export class AttendanceProtocol {
   }
 
   /**
-   * Split a large string payload into bounded framing packets.
-   * Frame header format: ATTF1:<txId>:<seq4>:<total4>:<base64Chunk>
+   * Split a payload into compact binary frames sized to fit within maxFrameSize (raw ATT payload).
+   * Frame format:
+   * [0xAC, 0x01, txIdHi, txIdLo, seq, total, ...chunkBytes]
+   * Header size: 6 bytes.
+   * Frame size <= maxFrameSize (guaranteed).
    */
-  public static createFrames(rawPayload: string, txId: string, chunkSize = AttendanceProtocol.DEFAULT_CHUNK_SIZE): string[] {
-    const rawBytes = Buffer.from(rawPayload, 'utf-8');
-    if (rawBytes.length > this.MAX_PAYLOAD_BYTES) {
+  public static createBinaryFrames(
+    payload: string | Uint8Array,
+    txIdNum: number,
+    maxFrameSize: number,
+  ): Uint8Array[] {
+    const payloadBytes = typeof payload === 'string' ? Buffer.from(payload, 'utf-8') : Buffer.from(payload);
+
+    if (payloadBytes.length > this.MAX_PAYLOAD_BYTES) {
       throw new Error(`PAYLOAD_EXCEEDS_LIMIT: Max allowed size is ${this.MAX_PAYLOAD_BYTES} bytes`);
     }
 
-    const b64 = rawBytes.toString('base64');
-    const totalChunks = Math.ceil(b64.length / chunkSize);
-    const frames: string[] = [];
+    if (maxFrameSize < BINARY_HEADER_SIZE + 1) {
+      throw new Error(`UNSUPPORTED_MTU: Frame limit ${maxFrameSize} is below minimum requirement (${BINARY_HEADER_SIZE + 1} bytes)`);
+    }
 
+    const maxChunkSize = maxFrameSize - BINARY_HEADER_SIZE;
+    const totalChunks = Math.ceil(payloadBytes.length / maxChunkSize) || 1;
+
+    if (totalChunks > 255) {
+      throw new Error(`PAYLOAD_TOO_LARGE_FOR_FRAMING: Requires ${totalChunks} chunks, max 255 supported`);
+    }
+
+    const frames: Uint8Array[] = [];
     for (let i = 0; i < totalChunks; i++) {
-      const chunk = b64.substring(i * chunkSize, (i + 1) * chunkSize);
-      const seqStr = (i + 1).toString().padStart(4, '0');
-      const totalStr = totalChunks.toString().padStart(4, '0');
-      frames.push(`ATTF1:${txId}:${seqStr}:${totalStr}:${chunk}`);
+      const start = i * maxChunkSize;
+      const end = Math.min(start + maxChunkSize, payloadBytes.length);
+      const chunk = payloadBytes.subarray(start, end);
+
+      const frame = Buffer.alloc(BINARY_HEADER_SIZE + chunk.length);
+      frame[0] = FRAME_MAGIC_BYTE;
+      frame[1] = FRAME_VERSION_BYTE;
+      frame.writeUInt16BE(txIdNum & 0xffff, 2);
+      frame[4] = i + 1; // 1-based sequence
+      frame[5] = totalChunks;
+      frame.set(chunk, BINARY_HEADER_SIZE);
+
+      frames.push(new Uint8Array(frame));
     }
 
     return frames;
   }
 
   /**
-   * Parse a single frame packet.
+   * Parse a single compact binary frame packet.
    */
-  public static parseFrame(frameStr: string): BleFramePacket {
-    const parts = frameStr.split(':');
-    if (parts.length < 5 || parts[0] !== 'ATTF1') {
-      throw new Error('INVALID_FRAME_HEADER: Expected ATTF1 frame format');
+  public static parseBinaryFrame(frameBytes: Uint8Array): BleFramePacket {
+    if (frameBytes.length < BINARY_HEADER_SIZE) {
+      throw new Error('INVALID_FRAME_HEADER: Binary frame shorter than 6-byte header');
     }
 
-    const txId = parts[1];
-    const seq = parseInt(parts[2], 10);
-    const total = parseInt(parts[3], 10);
-    const chunk = parts.slice(4).join(':'); // Handle any colons in chunk
-
-    if (isNaN(seq) || isNaN(total) || seq < 1 || seq > total) {
-      throw new Error(`INVALID_FRAME_SEQUENCE: seq=${seq}, total=${total}`);
+    if (frameBytes[0] !== FRAME_MAGIC_BYTE || frameBytes[1] !== FRAME_VERSION_BYTE) {
+      throw new Error('INVALID_FRAME_MAGIC: Header does not match AttendClass v1 magic bytes');
     }
 
+    const buf = Buffer.from(frameBytes);
+    const txId = buf.readUInt16BE(2);
+    const seq = buf[4];
+    const total = buf[5];
+
+    if (seq < 1 || seq > total) {
+      throw new Error(`INVALID_FRAME_SEQUENCE: Sequence ${seq} out of bounds for total ${total}`);
+    }
+
+    const chunk = frameBytes.subarray(BINARY_HEADER_SIZE);
     return { txId, seq, total, chunk };
+  }
+
+  /**
+   * Helper to create frames as Base64 strings (for transport) or raw frames.
+   */
+  public static createFrames(rawPayload: string, txId: string, maxFrameSize = 20): string[] {
+    const txIdNum = this.eventIdToTxId(txId);
+    const binaryFrames = this.createBinaryFrames(rawPayload, txIdNum, maxFrameSize);
+    return binaryFrames.map((f) => Buffer.from(f).toString('base64'));
+  }
+
+  /**
+   * Convert an eventId string (UUID or hash) into a deterministic 16-bit transaction ID number.
+   */
+  public static eventIdToTxId(eventId: string): number {
+    let hash = 0;
+    for (let i = 0; i < eventId.length; i++) {
+      hash = ((hash << 5) - hash + eventId.charCodeAt(i)) & 0xffff;
+    }
+    return hash === 0 ? 1 : hash;
   }
 }
 
 /**
- * Reassembles chunked BLE frames with timeout and buffer bounds.
+ * Reassembles chunked BLE binary frames with timeout, duplicate detection, and bounds checking.
  */
 export class FrameReassembler {
-  private chunks = new Map<number, string>();
+  private chunks = new Map<number, Uint8Array>();
   private totalExpected = 0;
-  private txId: string | null = null;
+  private txId: number | null = null;
   private createdAt = Date.now();
   private readonly timeoutMs: number;
 
@@ -262,31 +345,90 @@ export class FrameReassembler {
     this.timeoutMs = timeoutMs;
   }
 
-  public addFrame(frameStr: string): { complete: boolean; payload?: string } {
+  public addFrame(
+    frameInput: Uint8Array | string,
+  ): { complete: boolean; payload?: string; payloadBytes?: Uint8Array } {
     if (Date.now() - this.createdAt > this.timeoutMs) {
       throw new Error('FRAME_REASSEMBLY_TIMEOUT: Incomplete packet stream timed out');
     }
 
-    const frame = AttendanceProtocol.parseFrame(frameStr);
+    let frameBytes: Uint8Array;
+    if (typeof frameInput === 'string') {
+      // Check if legacy ATTF1 format
+      if (frameInput.startsWith('ATTF1:')) {
+        const parts = frameInput.split(':');
+        if (parts.length < 5) throw new Error('INVALID_FRAME_HEADER: Expected ATTF1 frame format');
+        const txId = AttendanceProtocol.eventIdToTxId(parts[1]);
+        const seq = parseInt(parts[2], 10);
+        const total = parseInt(parts[3], 10);
+        const chunk = new Uint8Array(Buffer.from(parts.slice(4).join(':'), 'base64'));
+        return this.processChunk(txId, seq, total, chunk);
+      }
 
-    if (this.txId === null) {
-      this.txId = frame.txId;
-      this.totalExpected = frame.total;
-    } else if (this.txId !== frame.txId) {
-      throw new Error(`TRANSACTION_MISMATCH: Frame txId=${frame.txId} does not match active txId=${this.txId}`);
+      // Try decoding base64
+      try {
+        const decoded = Buffer.from(frameInput, 'base64');
+        if (decoded.length >= BINARY_HEADER_SIZE && decoded[0] === FRAME_MAGIC_BYTE && decoded[1] === FRAME_VERSION_BYTE) {
+          frameBytes = new Uint8Array(decoded);
+        } else {
+          frameBytes = new Uint8Array(Buffer.from(frameInput, 'utf-8'));
+        }
+      } catch {
+        frameBytes = new Uint8Array(Buffer.from(frameInput, 'utf-8'));
+      }
+    } else {
+      frameBytes = frameInput;
     }
 
-    this.chunks.set(frame.seq, frame.chunk);
+    // Check if packet is a binary frame
+    if (
+      frameBytes.length >= BINARY_HEADER_SIZE &&
+      frameBytes[0] === FRAME_MAGIC_BYTE &&
+      frameBytes[1] === FRAME_VERSION_BYTE
+    ) {
+      const frame = AttendanceProtocol.parseBinaryFrame(frameBytes);
+      return this.processChunk(frame.txId, frame.seq, frame.total, frame.chunk);
+    }
+
+    // Unfragmented payload
+    const fullBuffer = Buffer.from(frameBytes);
+    return {
+      complete: true,
+      payload: fullBuffer.toString('utf-8'),
+      payloadBytes: frameBytes,
+    };
+  }
+
+  private processChunk(
+    txId: number,
+    seq: number,
+    total: number,
+    chunk: Uint8Array,
+  ): { complete: boolean; payload?: string; payloadBytes?: Uint8Array } {
+    if (this.txId === null) {
+      this.txId = txId;
+      this.totalExpected = total;
+    } else if (this.txId !== txId) {
+      throw new Error(`TRANSACTION_MISMATCH: Frame txId=${txId} does not match active txId=${this.txId}`);
+    }
+
+    // Store chunk (idempotently handles duplicate chunks)
+    this.chunks.set(seq, chunk);
 
     if (this.chunks.size === this.totalExpected) {
-      let assembledB64 = '';
+      const chunkList: Uint8Array[] = [];
       for (let i = 1; i <= this.totalExpected; i++) {
         const c = this.chunks.get(i);
         if (!c) throw new Error(`MISSING_FRAME_CHUNK: Missing sequence chunk ${i}`);
-        assembledB64 += c;
+        chunkList.push(c);
       }
-      const rawPayload = Buffer.from(assembledB64, 'base64').toString('utf-8');
-      return { complete: true, payload: rawPayload };
+
+      const fullBuffer = Buffer.concat(chunkList.map((c) => Buffer.from(c)));
+      return {
+        complete: true,
+        payload: fullBuffer.toString('utf-8'),
+        payloadBytes: new Uint8Array(fullBuffer),
+      };
     }
 
     return { complete: false };

@@ -6,6 +6,8 @@ import {
   CHALLENGE_CHAR_UUID,
   SUBMISSION_CHAR_UUID,
   ACK_CHAR_UUID,
+  MIN_SUPPORTED_MTU,
+  MIN_ATT_PAYLOAD,
   AttendanceProtocol,
   TerminalChallengePayload,
   AttendanceSubmissionPayload,
@@ -26,6 +28,7 @@ export type BleTransportErrorCode =
   | 'BLUETOOTH_UNAUTHORIZED'
   | 'DISCOVERY_TIMEOUT'
   | 'CONNECTION_FAILED'
+  | 'UNSUPPORTED_MTU'
   | 'DISCONNECTED'
   | 'CHALLENGE_READ_FAILED'
   | 'SUBMISSION_WRITE_FAILED'
@@ -39,6 +42,7 @@ export class BleTransportService {
   private connectedDevice: Device | null = null;
   private isScanning = false;
   private cancelled = false;
+  private negotiatedMtu = 23;
 
   constructor(manager?: BleManager) {
     this.bleManager = manager || new BleManager();
@@ -221,20 +225,37 @@ export class BleTransportService {
         autoConnect: false,
       });
 
+      let negotiated = 23;
       if (Platform.OS === 'android') {
         try {
-          await connected.requestMTU(512);
+          const withMtu = await connected.requestMTU(512);
+          negotiated = withMtu.mtu || 512;
         } catch {
-          // MTU request optional
+          negotiated = connected.mtu || 23;
         }
+      } else {
+        negotiated = connected.mtu || 23;
       }
+
+      if (negotiated < MIN_SUPPORTED_MTU) {
+        await this.bleManager.cancelDeviceConnection(device.id).catch(() => {});
+        throw new Error(
+          `UNSUPPORTED_MTU: Terminal connection negotiated MTU of ${negotiated}, but minimum required is ${MIN_SUPPORTED_MTU}`,
+        );
+      }
+      this.negotiatedMtu = negotiated;
 
       await connected.discoverAllServicesAndCharacteristics();
       this.connectedDevice = connected;
-      DiagnosticLogger.info('BLE_CONNECT', `Connected and discovered services for ${device.id}`);
+      DiagnosticLogger.info('BLE_CONNECT', `Connected and discovered services for ${device.id}`, {
+        negotiatedMtu: this.negotiatedMtu,
+      });
       return connected;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('UNSUPPORTED_MTU')) {
+        throw err;
+      }
       throw new Error(`CONNECTION_FAILED: Could not establish BLE connection to terminal: ${msg}`);
     }
   }
@@ -253,7 +274,15 @@ export class BleTransportService {
         throw new Error('Empty challenge characteristic value');
       }
 
-      const decoded = Buffer.from(char.value, 'base64').toString('utf-8');
+      const rawBytes = new Uint8Array(Buffer.from(char.value, 'base64'));
+      const reassembler = new FrameReassembler(10000);
+      const res = reassembler.addFrame(rawBytes);
+
+      if (res.complete && res.payload) {
+        return AttendanceProtocol.parseChallenge(res.payload);
+      }
+
+      const decoded = Buffer.from(rawBytes).toString('utf-8');
       return AttendanceProtocol.parseChallenge(decoded);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -266,7 +295,7 @@ export class BleTransportService {
    *
    * Crucial reliability improvements:
    * 1. Subscribes for ACK BEFORE writing submission to avoid race conditions.
-   * 2. Frames/chunks payload when necessary to fit within bounded MTU.
+   * 2. Frames payload into compact binary frames sized strictly within connection MTU limit.
    * 3. Treats post-submission disconnects as uncertain outcome (SUBMISSION_PENDING_RECONCILIATION).
    */
   public async submitAttendanceAndAwaitAck(
@@ -275,8 +304,7 @@ export class BleTransportService {
     timeoutMs = 12000,
   ): Promise<TerminalAckPayload> {
     const rawSubmissionJson = JSON.stringify(submission);
-    const submissionBase64 = AttendanceProtocol.serializeSubmission(submission);
-    const txId = submission.event_id.substring(0, 8);
+    const txIdNum = AttendanceProtocol.eventIdToTxId(submission.event_id);
 
     let ackReceived = false;
     let writeCompleted = false;
@@ -336,21 +364,11 @@ export class BleTransportService {
 
             if (characteristic?.value) {
               try {
-                const decoded = Buffer.from(characteristic.value, 'base64').toString('utf-8');
+                const frameBytes = new Uint8Array(Buffer.from(characteristic.value, 'base64'));
+                const res = reassembler.addFrame(frameBytes);
+                if (!res.complete || !res.payload) return;
 
-                // Check if ACK is sent as chunked frame
-                if (decoded.startsWith('ATTF1:')) {
-                  const res = reassembler.addFrame(decoded);
-                  if (!res.complete || !res.payload) return;
-                  const ack = AttendanceProtocol.parseAck(res.payload, submission.event_id);
-                  ackReceived = true;
-                  cleanup();
-                  resolve(ack);
-                  return;
-                }
-
-                // Normal single-packet ACK
-                const ack = AttendanceProtocol.parseAck(decoded, submission.event_id);
+                const ack = AttendanceProtocol.parseAck(res.payload, submission.event_id);
                 ackReceived = true;
                 cleanup();
                 resolve(ack);
@@ -367,31 +385,31 @@ export class BleTransportService {
         return;
       }
 
-      // ── Step 2: Write submission payload (chunked or single) ───────────────
+      // ── Step 2: Write submission payload with MTU-sized binary framing ──────
       (async () => {
         try {
-          // If payload is larger than standard 120 bytes, split into bounded frames
-          if (submissionBase64.length > 120) {
-            const frames = AttendanceProtocol.createFrames(rawSubmissionJson, txId, 90);
-            for (const frame of frames) {
-              const frameB64 = Buffer.from(frame, 'utf-8').toString('base64');
-              await device.writeCharacteristicWithResponseForService(
-                ATTENDCLASS_SERVICE_UUID,
-                SUBMISSION_CHAR_UUID,
-                frameB64,
-              );
-            }
-          } else {
+          const effectiveMaxPayload = Math.max(MIN_ATT_PAYLOAD, this.negotiatedMtu - 3);
+          const binaryFrames = AttendanceProtocol.createBinaryFrames(
+            rawSubmissionJson,
+            txIdNum,
+            effectiveMaxPayload,
+          );
+
+          for (const frame of binaryFrames) {
+            // react-native-ble-plx characteristic writes require Base64 of the raw bytes
+            const frameB64 = Buffer.from(frame).toString('base64');
             await device.writeCharacteristicWithResponseForService(
               ATTENDCLASS_SERVICE_UUID,
               SUBMISSION_CHAR_UUID,
-              submissionBase64,
+              frameB64,
             );
           }
 
           writeCompleted = true;
           DiagnosticLogger.info('BLE_SUBMIT', 'Attendance packet written to terminal characteristic', {
             eventId: submission.event_id,
+            frameCount: binaryFrames.length,
+            effectiveMaxPayload,
           });
         } catch (writeErr: unknown) {
           cleanup();

@@ -1,6 +1,8 @@
+/* eslint-disable no-bitwise */
 import { NativeModules, Platform } from 'react-native';
 import { p256 } from '@noble/curves/nist.js';
 import { Buffer } from 'buffer';
+import * as Keychain from 'react-native-keychain';
 import { DiagnosticLogger } from './DiagnosticLogger';
 import { LocalApprovalErrorCode } from './LocalApprovalService';
 
@@ -35,8 +37,32 @@ interface SimulatedKeyEntry {
 
 const simulatedKeyStore = new Map<string, SimulatedKeyEntry>();
 
+// NIST P-256 curve order n and half n
+export const SECP256R1_N = BigInt('0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551');
+export const SECP256R1_HALF_N = SECP256R1_N >> 1n;
+
+// SPKI header for secp256r1 (id-ecPublicKey + secp256r1 OID + BIT STRING wrapper)
+export const SPKI_P256_PREFIX_HEX = '3059301306072a8648ce3d020106082a8648ce3d030107034200';
+
+/**
+ * Validate that bytes represent a valid uncompressed NIST P-256 SPKI public key.
+ * Expected structure: 91 bytes, standard ASN.1 header (26 bytes) + 0x04 uncompressed point (65 bytes).
+ */
+export function validateSpkiP256(spkiInput: Uint8Array | string): boolean {
+  try {
+    const bytes = typeof spkiInput === 'string' ? Buffer.from(spkiInput, 'base64') : Buffer.from(spkiInput);
+    if (bytes.length !== 91) return false;
+    const prefixHex = Buffer.from(bytes.subarray(0, 26)).toString('hex');
+    if (prefixHex !== SPKI_P256_PREFIX_HEX) return false;
+    if (bytes[26] !== 0x04) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // DER encoding helpers for ECDSA P-256
-function encodeDERSignature(r: bigint, s: bigint): Uint8Array {
+export function encodeDERSignature(r: bigint, s: bigint): Uint8Array {
   function toIntegerDer(num: bigint): number[] {
     let hex = num.toString(16);
     if (hex.length % 2 !== 0) hex = '0' + hex;
@@ -50,12 +76,10 @@ function encodeDERSignature(r: bigint, s: bigint): Uint8Array {
   return new Uint8Array([0x30, body.length, ...body]);
 }
 
-function decodeDERSignature(der: Uint8Array): { r: bigint; s: bigint } {
+export function decodeDERSignature(der: Uint8Array): { r: bigint; s: bigint } {
   let offset = 2;
   if (der[0] !== 0x30) throw new Error('Invalid DER signature sequence header');
-  // eslint-disable-next-line no-bitwise
   if (der[1] & 0x80) {
-    // eslint-disable-next-line no-bitwise
     const lenBytes = der[1] & 0x7f;
     offset = 2 + lenBytes;
   }
@@ -71,27 +95,121 @@ function decodeDERSignature(der: Uint8Array): { r: bigint; s: bigint } {
   return { r, s };
 }
 
-// SPKI header for secp256r1 (id-ecPublicKey + secp256r1 OID + BIT STRING wrapper)
-const SPKI_P256_PREFIX_HEX = '3059301306072a8648ce3d020106082a8648ce3d030107034200';
+/**
+ * Convert ASN.1 DER ECDSA signature into 64-byte raw IEEE P1363 (R || S) format.
+ * Canonicalizes S to low-S form.
+ */
+export function derToCompactSignature(derInput: Uint8Array | string): Uint8Array {
+  const derBytes = typeof derInput === 'string' ? Buffer.from(derInput, 'base64') : Buffer.from(derInput);
+  if (derBytes.length === 64) {
+    return new Uint8Array(derBytes);
+  }
+  const { r, s } = decodeDERSignature(derBytes);
+  const canonicalS = s > SECP256R1_HALF_N ? SECP256R1_N - s : s;
+
+  const compact = new Uint8Array(64);
+  const rHex = r.toString(16).padStart(64, '0');
+  const sHex = canonicalS.toString(16).padStart(64, '0');
+  compact.set(Buffer.from(rHex, 'hex'), 0);
+  compact.set(Buffer.from(sHex, 'hex'), 32);
+  return compact;
+}
+
+/**
+ * Convert 64-byte raw IEEE P1363 (R || S) signature into ASN.1 DER format.
+ * Validates scalar ranges [1, n-1] and enforces low-S.
+ */
+export function compactToDerSignature(compactInput: Uint8Array | string): Uint8Array {
+  const compact = typeof compactInput === 'string' ? Buffer.from(compactInput, 'base64') : Buffer.from(compactInput);
+  if (compact.length !== 64) {
+    throw new Error(`INVALID_COMPACT_SIGNATURE_LENGTH: Expected 64 bytes, got ${compact.length}`);
+  }
+  const rHex = Buffer.from(compact.subarray(0, 32)).toString('hex');
+  const sHex = Buffer.from(compact.subarray(32, 64)).toString('hex');
+  const r = BigInt('0x' + rHex);
+  const s = BigInt('0x' + sHex);
+
+  if (r <= 0n || r >= SECP256R1_N || s <= 0n || s >= SECP256R1_N) {
+    throw new Error('SIGNATURE_OUT_OF_RANGE: R or S is not within [1, n-1]');
+  }
+
+  const canonicalS = s > SECP256R1_HALF_N ? SECP256R1_N - s : s;
+  return encodeDERSignature(r, canonicalS);
+}
 
 export class DeviceSecurityService {
   public static readonly CREDENTIAL_VERSION = 'v1';
   public static readonly ALGORITHM: 'ECDSA_P256_SHA256' = 'ECDSA_P256_SHA256';
 
+  private static activeCredentialPointers = new Map<string, string>(); // accountId -> credentialId
+  private static stagingCredentialStore = new Map<string, string>(); // accountId -> staged credentialId
+  private static __forceProductionEnvironmentForTesting = false;
+
+  /**
+   * For testing: force production environment flag to test platform safeguards
+   */
+  public static __setForceProductionEnvironment(force: boolean): void {
+    this.__forceProductionEnvironmentForTesting = force;
+  }
+
+  /**
+   * Derive Keystore alias permanently indexed by credential ID.
+   * Avoids key regeneration during promotion.
+   */
+  public static getCredentialAlias(credentialId: string): string {
+    return `attendclass_keystore_cred_${credentialId}`;
+  }
+
   /**
    * Derive canonical alias for an account's active signing key.
-   * Isolates keys so one account cannot use another's signing key.
    */
   public static getActiveAlias(accountId: string): string {
+    const credId = this.activeCredentialPointers.get(accountId);
+    if (credId) {
+      return this.getCredentialAlias(credId);
+    }
     return `attendclass_keystore_active_${accountId}`;
   }
 
   /**
    * Derive canonical alias for staging a new key during enrolment or replacement.
-   * Protects existing working key from deletion until replacement succeeds.
    */
   public static getStagingAlias(accountId: string): string {
+    const stagedId = this.stagingCredentialStore.get(accountId);
+    if (stagedId) {
+      return this.getCredentialAlias(stagedId);
+    }
     return `attendclass_keystore_stage_${accountId}`;
+  }
+
+  public static async getActiveCredentialId(accountId: string): Promise<string | null> {
+    if (this.activeCredentialPointers.has(accountId)) {
+      return this.activeCredentialPointers.get(accountId)!;
+    }
+    try {
+      const res = await Keychain.getGenericPassword({
+        service: `attendclass_cred_ptr_${accountId}`,
+      });
+      if (res && res.password) {
+        this.activeCredentialPointers.set(accountId, res.password);
+        return res.password;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  public static async setActiveCredentialId(accountId: string, credentialId: string): Promise<void> {
+    this.activeCredentialPointers.set(accountId, credentialId);
+    try {
+      await Keychain.setGenericPassword('account', credentialId, {
+        service: `attendclass_cred_ptr_${accountId}`,
+        accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+      });
+    } catch {
+      // ignore
+    }
   }
 
   /**
@@ -116,30 +234,42 @@ export class DeviceSecurityService {
 
   /**
    * Generate an OS-level ECDSA P-256 keypair.
-   * On Android, creates a non-exportable key in Android Keystore with biometric gating.
-   * When isStaging=true, creates key under staging alias without touching active key.
+   * On Android, creates a non-exportable key in Android Keystore with biometric gating,
+   * indexed permanently by credential ID so key promotion never regenerates the keypair.
    */
   public static async generateDeviceKey(
     accountId: string,
     isStaging = false,
+    customCredentialId?: string,
   ): Promise<DeviceKeyMetadata> {
-    const alias = isStaging ? this.getStagingAlias(accountId) : this.getActiveAlias(accountId);
+    const credentialId =
+      customCredentialId ||
+      `cred_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const alias = this.getCredentialAlias(credentialId);
+
+    if (isStaging) {
+      this.stagingCredentialStore.set(accountId, credentialId);
+    }
 
     if (this.isNativeAndroidKeyStoreAvailable()) {
       try {
         const result = await NativeModules.AndroidKeyStore.generateKey(alias, true);
-        const credId = this.computeCredentialId(result.publicKeyDerBase64);
 
         DiagnosticLogger.info('KEYSTORE', 'Generated native Android Keystore key', {
           alias,
+          credentialId,
           securityLevel: result.securityLevel,
           isInsideSecureHardware: result.isInsideSecureHardware,
         });
 
+        if (!isStaging) {
+          await this.setActiveCredentialId(accountId, credentialId);
+        }
+
         return {
           publicKeyDerBase64: result.publicKeyDerBase64,
           algorithm: this.ALGORITHM,
-          credentialId: credId,
+          credentialId,
           credentialVersion: this.CREDENTIAL_VERSION,
           securityLevel: result.securityLevel,
           isInsideSecureHardware: !!result.isInsideSecureHardware,
@@ -152,34 +282,49 @@ export class DeviceSecurityService {
       }
     }
 
-    // Fallback simulation (iOS / Jest / Simulator test environment)
-    // NOTE: On real iOS devices, production implementation requires native Apple Secure Enclave bridge.
-    // We document and report this explicitly as SIMULATOR_TEST / SOFTWARE.
+    // iOS and Simulator validation
+    if (Platform.OS === 'ios') {
+      const isTestOrDev =
+        !DeviceSecurityService.__forceProductionEnvironmentForTesting &&
+        ((typeof __DEV__ !== 'undefined' && __DEV__) ||
+          ((globalThis as any)?.process?.env?.NODE_ENV === 'test') ||
+          typeof jest !== 'undefined');
+      if (!isTestOrDev) {
+        throw new Error(
+          'IOS_SECURE_ENCLAVE_NOT_IMPLEMENTED: Production iOS requires native Apple Secure Enclave bridge. Software simulation is blocked.',
+        );
+      }
+    }
+
     const priv = p256.utils.randomSecretKey();
     const uncompressedPub = p256.getPublicKey(priv, false); // 65 bytes: 0x04 || X || Y
     const spkiPrefix = Buffer.from(SPKI_P256_PREFIX_HEX, 'hex');
     const fullSpki = Buffer.concat([spkiPrefix, Buffer.from(uncompressedPub)]);
     const pubBase64 = fullSpki.toString('base64');
-    const credId = this.computeCredentialId(pubBase64);
 
     simulatedKeyStore.set(alias, {
       privateKeyBytes: priv,
       publicKeyDerBase64: pubBase64,
-      credentialId: credId,
+      credentialId,
       createdAtIso: new Date().toISOString(),
       requireAuth: true,
       securityLevel: 'SIMULATOR_TEST',
     });
 
+    if (!isStaging) {
+      await this.setActiveCredentialId(accountId, credentialId);
+    }
+
     DiagnosticLogger.info('KEYSTORE', 'Generated simulation ECDSA P-256 key', {
       alias,
+      credentialId,
       securityLevel: 'SIMULATOR_TEST',
     });
 
     return {
       publicKeyDerBase64: pubBase64,
       algorithm: this.ALGORITHM,
-      credentialId: credId,
+      credentialId,
       credentialVersion: this.CREDENTIAL_VERSION,
       securityLevel: 'SIMULATOR_TEST',
       isInsideSecureHardware: false,
@@ -189,44 +334,53 @@ export class DeviceSecurityService {
 
   /**
    * Commit staging key to active status after backend registration succeeds.
-   * Safely deletes old key only after replacement is confirmed.
+   * Updates Keychain active credential pointer without altering the Keystore private key.
    */
-  public static async commitStagingKey(accountId: string): Promise<void> {
-    const stageAlias = this.getStagingAlias(accountId);
-    const activeAlias = this.getActiveAlias(accountId);
-
-    if (this.isNativeAndroidKeyStoreAvailable()) {
-      // In Android Keystore, replace active key by re-generating or promoting staging
-      // To ensure atomicity without cross-alias move, delete old active then rename/repoint
-      await NativeModules.AndroidKeyStore.deleteKey(activeAlias).catch(() => {});
-      // Note: Keystore aliases are finalized; future operations use active alias
-      // We re-generate active or preserve stage reference
+  public static async commitStagingKey(accountId: string, explicitCredentialId?: string): Promise<void> {
+    const credId = explicitCredentialId || this.stagingCredentialStore.get(accountId);
+    if (!credId) {
+      return;
     }
 
-    if (simulatedKeyStore.has(stageAlias)) {
-      const stage = simulatedKeyStore.get(stageAlias)!;
-      simulatedKeyStore.delete(activeAlias);
-      simulatedKeyStore.set(activeAlias, stage);
-      simulatedKeyStore.delete(stageAlias);
-    }
+    await this.setActiveCredentialId(accountId, credId);
+    this.stagingCredentialStore.delete(accountId);
+    DiagnosticLogger.info('KEYSTORE', `Committed staging key pointer for account ${accountId}`, { credId });
   }
 
   /**
    * Discard staging key on failed activation attempt without altering active key.
    */
-  public static async discardStagingKey(accountId: string): Promise<void> {
-    const stageAlias = this.getStagingAlias(accountId);
+  public static async discardStagingKey(accountId: string, explicitCredentialId?: string): Promise<void> {
+    const credId = explicitCredentialId || this.stagingCredentialStore.get(accountId);
+    if (!credId) return;
+
+    const alias = this.getCredentialAlias(credId);
     if (this.isNativeAndroidKeyStoreAvailable()) {
-      await NativeModules.AndroidKeyStore.deleteKey(stageAlias).catch(() => {});
+      await NativeModules.AndroidKeyStore.deleteKey(alias).catch(() => {});
     }
-    simulatedKeyStore.delete(stageAlias);
+    simulatedKeyStore.delete(alias);
+    this.stagingCredentialStore.delete(accountId);
+    DiagnosticLogger.info('KEYSTORE', `Discarded staging key for account ${accountId}`, { credId });
   }
 
   /**
-   * Check if an active key exists for this account.
+   * Recover an already-registered credential on startup after an interruption.
+   * If the key exists in Keystore, points active credential to it without re-enrolling.
    */
-  public static async hasActiveKey(accountId: string): Promise<boolean> {
-    const alias = this.getActiveAlias(accountId);
+  public static async syncRegisteredCredential(
+    accountId: string,
+    registeredCredentialId: string,
+  ): Promise<boolean> {
+    const exists = await this.hasCredentialKey(registeredCredentialId);
+    if (exists) {
+      await this.setActiveCredentialId(accountId, registeredCredentialId);
+      return true;
+    }
+    return false;
+  }
+
+  public static async hasCredentialKey(credentialId: string): Promise<boolean> {
+    const alias = this.getCredentialAlias(credentialId);
     if (this.isNativeAndroidKeyStoreAvailable()) {
       try {
         return await NativeModules.AndroidKeyStore.hasKey(alias);
@@ -235,6 +389,25 @@ export class DeviceSecurityService {
       }
     }
     return simulatedKeyStore.has(alias);
+  }
+
+  /**
+   * Check if an active key exists for this account.
+   */
+  public static async hasActiveKey(accountId: string): Promise<boolean> {
+    const credId = await this.getActiveCredentialId(accountId);
+    if (credId) {
+      return this.hasCredentialKey(credId);
+    }
+    const legacyAlias = `attendclass_keystore_active_${accountId}`;
+    if (this.isNativeAndroidKeyStoreAvailable()) {
+      try {
+        return await NativeModules.AndroidKeyStore.hasKey(legacyAlias);
+      } catch {
+        return false;
+      }
+    }
+    return simulatedKeyStore.has(legacyAlias);
   }
 
   /**
@@ -319,15 +492,15 @@ export class DeviceSecurityService {
   }
 
   /**
-   * Verify an ECDSA P-256 DER signature against SPKI DER public key.
+   * Verify an ECDSA P-256 DER or IEEE P1363 compact signature against SPKI DER public key.
    */
   public static verifySignature(
     canonicalMessage: string,
-    signatureDerBase64: string,
-    publicKeyDerBase64: string,
+    signatureBase64: string,
+    publicKeySpkiBase64: string,
   ): boolean {
     try {
-      const pubBytes = Buffer.from(publicKeyDerBase64, 'base64');
+      const pubBytes = Buffer.from(publicKeySpkiBase64, 'base64');
       let uncompressedPub: Uint8Array;
       if (pubBytes.length === 91 && pubBytes[0] === 0x30) {
         uncompressedPub = pubBytes.subarray(26);
@@ -337,14 +510,7 @@ export class DeviceSecurityService {
         return false;
       }
 
-      const sigDerBytes = Buffer.from(signatureDerBase64, 'base64');
-      const { r, s } = decodeDERSignature(sigDerBytes);
-      const compactSig = new Uint8Array(64);
-      const rHex = r.toString(16).padStart(64, '0');
-      const sHex = s.toString(16).padStart(64, '0');
-      compactSig.set(Buffer.from(rHex, 'hex'), 0);
-      compactSig.set(Buffer.from(sHex, 'hex'), 32);
-
+      const compactSig = derToCompactSignature(signatureBase64);
       const msgBytes = Buffer.from(canonicalMessage, 'utf-8');
       return p256.verify(compactSig, msgBytes, uncompressedPub);
     } catch {
@@ -356,7 +522,8 @@ export class DeviceSecurityService {
    * Retrieve active public key DER Base64 for the specified account.
    */
   public static async getActivePublicKey(accountId: string): Promise<string | null> {
-    const alias = this.getActiveAlias(accountId);
+    const credId = await this.getActiveCredentialId(accountId);
+    const alias = credId ? this.getCredentialAlias(credId) : this.getActiveAlias(accountId);
     if (simulatedKeyStore.has(alias)) {
       return simulatedKeyStore.get(alias)!.publicKeyDerBase64;
     }
@@ -368,7 +535,8 @@ export class DeviceSecurityService {
    * Delete key upon explicit user revocation.
    */
   public static async deleteKey(accountId: string): Promise<void> {
-    const alias = this.getActiveAlias(accountId);
+    const credId = await this.getActiveCredentialId(accountId);
+    const alias = credId ? this.getCredentialAlias(credId) : this.getActiveAlias(accountId);
     const stageAlias = this.getStagingAlias(accountId);
     if (this.isNativeAndroidKeyStoreAvailable()) {
       await NativeModules.AndroidKeyStore.deleteKey(alias).catch(() => {});
@@ -376,12 +544,21 @@ export class DeviceSecurityService {
     }
     simulatedKeyStore.delete(alias);
     simulatedKeyStore.delete(stageAlias);
+    this.activeCredentialPointers.delete(accountId);
+    this.stagingCredentialStore.delete(accountId);
+    try {
+      await Keychain.resetGenericPassword({ service: `attendclass_cred_ptr_${accountId}` });
+    } catch {
+      // ignore
+    }
   }
 
   /**
-   * For testing: Reset in-memory simulation keys.
+   * For testing: Reset in-memory simulation keys and credential pointers.
    */
   public static __resetSimulatedKeyStore(): void {
     simulatedKeyStore.clear();
+    this.activeCredentialPointers.clear();
+    this.stagingCredentialStore.clear();
   }
 }

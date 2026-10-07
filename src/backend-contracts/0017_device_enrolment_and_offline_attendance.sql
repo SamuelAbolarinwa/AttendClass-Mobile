@@ -161,8 +161,9 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'error', 'Invalid activation code format (expected 8 alphanumeric characters)');
   END IF;
 
-  IF p_device_public_key IS NULL OR length(trim(p_device_public_key)) < 64 OR length(trim(p_device_public_key)) > 512 THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'Invalid device public key length');
+  -- Validate uncompressed NIST P-256 (secp256r1) SPKI Base64 structure (exactly 124 chars, standard ASN.1 prefix)
+  IF p_device_public_key IS NULL OR length(trim(p_device_public_key)) != 124 OR NOT (p_device_public_key LIKE 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE%') THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Invalid device public key: Must be valid uncompressed NIST P-256 (secp256r1) SPKI format');
   END IF;
 
   _incoming_hash := encode(digest(upper(trim(p_activation_code)), 'sha256'), 'hex');
@@ -188,12 +189,16 @@ BEGIN
 
   IF _code_record.code_hash != _incoming_hash THEN
     UPDATE device_activation_codes
-    SET attempts = attempts + 1
+    SET attempts = attempts + 1,
+        consumed_at = CASE WHEN attempts + 1 >= max_attempts THEN now() ELSE NULL END
     WHERE id = _code_record.id;
 
     RETURN jsonb_build_object(
       'ok', false,
-      'error', 'Invalid activation code. Attempts remaining: ' || (_code_record.max_attempts - _code_record.attempts - 1)
+      'error', CASE
+        WHEN _code_record.attempts + 1 >= _code_record.max_attempts THEN 'Maximum activation attempts exceeded. Code has been invalidated.'
+        ELSE 'Invalid activation code. Attempts remaining: ' || (_code_record.max_attempts - _code_record.attempts - 1)
+      END
     );
   END IF;
 

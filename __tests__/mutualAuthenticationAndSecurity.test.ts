@@ -224,7 +224,7 @@ describe('Mutual Cryptographic Authentication & Protocol Integrity', () => {
 
   // ── 5. Fragmented BLE Packet Framing and Safe Reassembly ────────────────────
   test('chunks large payload into bounded frames and safely reassembles them', () => {
-    const txId = 'tx001122';
+    const txIdNum = AttendanceProtocol.eventIdToTxId('tx001122');
     const largePayload = JSON.stringify({
       version: 1,
       event_id: 'evt-large-payload-testing-ble-framing',
@@ -232,13 +232,15 @@ describe('Mutual Cryptographic Authentication & Protocol Integrity', () => {
       data: 'A'.repeat(300), // Ensures payload exceeds MTU
     });
 
-    const frames = AttendanceProtocol.createFrames(largePayload, txId, 60);
+    // Test with minimum ATT payload limit (20 bytes for MTU 23)
+    const frames = AttendanceProtocol.createBinaryFrames(largePayload, txIdNum, 20);
     expect(frames.length).toBeGreaterThan(1);
 
-    // All frames must have correct ATTF1 prefix and length bound
+    // All frames must have correct magic bytes (0xAC, 0x01) and strictly fit within 20 bytes
     for (const frame of frames) {
-      expect(frame.startsWith('ATTF1:')).toBe(true);
-      expect(frame.length).toBeLessThanOrEqual(100);
+      expect(frame[0]).toBe(0xac);
+      expect(frame[1]).toBe(0x01);
+      expect(frame.length).toBeLessThanOrEqual(20);
     }
 
     // Reassembly in order
@@ -254,8 +256,8 @@ describe('Mutual Cryptographic Authentication & Protocol Integrity', () => {
   });
 
   test('detects mismatched transactions during packet reassembly', () => {
-    const framesA = AttendanceProtocol.createFrames('payload A', 'txAAAAAA', 40);
-    const framesB = AttendanceProtocol.createFrames('payload B', 'txBBBBBB', 40);
+    const framesA = AttendanceProtocol.createBinaryFrames('payload A', 1001, 20);
+    const framesB = AttendanceProtocol.createBinaryFrames('payload B', 2002, 20);
 
     const reassembler = new FrameReassembler(5000);
     reassembler.addFrame(framesA[0]);

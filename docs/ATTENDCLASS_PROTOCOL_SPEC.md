@@ -2,27 +2,26 @@
 
 ## 1. Overview & Architecture
 
-AttendClass enables students to securely record attendance at physical lecture terminals (ESP32) via Bluetooth Low Energy (BLE) even when the student phone has no cellular or Wi-Fi internet connectivity.
+AttendClass enables students to record verifiable attendance at physical ESP32 terminals over Bluetooth Low Energy (BLE) even when the student phone has no cellular or Wi-Fi internet connectivity.
 
-### System Topology
 ```
-┌─────────────────────────────────┐
-│        AttendClass Mobile       │
-│  (Android Keystore, ECDSA P-256)│
-└───────────────▲─────────────────┘
-                │ BLE (GATT Custom Service)
-                │ Challenge - Response - Signed Receipt
-┌───────────────▼─────────────────┐
-│       AttendESP v3 Terminal     │
-│   (ESP32, SD Storage, mbedtls)  │
-└───────────────▲─────────────────┘
-                │ HTTPS (TLS with DigiCert Root G2 validation)
-                │ Periodic Bounded Batch Sync
-┌───────────────▼─────────────────┐
-│       Supabase Cloud Backend    │
-│  (Edge Function: hardware-sync) │
-│  (Database: attendance_logs)    │
-└─────────────────────────────────┘
+┌──────────────────────────────────────┐
+│         AttendClass Mobile           │
+│   (Android Keystore, ECDSA P-256)    │
+└──────────────────▲───────────────────┘
+                   │ BLE (GATT Custom Service)
+                   │ Binary MTU-23 Framing
+┌──────────────────▼───────────────────┐
+│        AttendESP v3 Terminal         │
+│     (ESP32, SD Storage, mbedtls)     │
+└──────────────────▲───────────────────┘
+                   │ HTTPS (DigiCert Root G2 validation)
+                   │ Bounded Batch Sync & Checkpoint
+┌──────────────────▼───────────────────┐
+│        Supabase Cloud Backend        │
+│   (Edge Function: hardware-sync)     │
+│   (Database: attendance_logs)        │
+└──────────────────────────────────────┘
 ```
 
 ---
@@ -36,176 +35,203 @@ All BLE communications take place over the AttendClass custom 128-bit GATT Servi
 |---|---|---|---|---|
 | **Primary Attendance Service** | `0000ff10-0000-1000-8000-00805f9b34fb` | Service | N/A | Base offline attendance service |
 | **Challenge Characteristic** | `0000ff11-0000-1000-8000-00805f9b34fb` | Characteristic | Read, Notify | Terminal issues time-bound cryptographic challenge |
-| **Submission Characteristic** | `0000ff12-0000-1000-8000-00805f9b34fb` | Characteristic | Write, Write Without Response | Phone transmits signed attendance record |
+| **Submission Characteristic** | `0000ff12-0000-1000-8000-00805f9b34fb` | Characteristic | Write, Write Without Response | Phone transmits signed attendance or reconciliation query |
 | **Acknowledgement / Receipt** | `0000ff13-0000-1000-8000-00805f9b34fb` | Characteristic | Read, Notify | Terminal issues durable signed receipt |
-| **Legacy Time Sync (v2)** | `0000ff01-0000-1000-8000-00805f9b34fb` | Characteristic | Write | Backward-compatible phone-to-terminal clock sync |
+| **Legacy Time Sync (v2)** | `0000ff01-0000-1000-8000-00805f9b34fb` | Characteristic | Write | Phone-to-terminal provisional clock sync |
 
 ---
 
 ## 3. Binary Framing & Transport Layer
 
-### 3.1 Motivation
-Standard BLE ATT MTU can be as low as 23 bytes (effective payload: 20 bytes). A full signed attendance submission (~250-350 bytes) or receipt exceeds 20 bytes. The protocol guarantees fragmentation, packet sequencing, duplicate detection, and bounded reassembly over arbitrary MTU sizes (23 to 517 bytes).
-
-### 3.2 6-Byte Binary Frame Header
-Every fragment transmitted across GATT characteristics uses a compact 6-byte binary header:
+### 3.1 6-Byte Binary Frame Header
+All packets transmitted over Characteristics `0000ff11`, `0000ff12`, and `0000ff13` adhere to the 6-byte binary framing format:
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|       Magic 0x41 0x54         |   Msg Type    |  Sequence Num |
+|  Magic (0xAC) | Version(0x01) |       Transaction ID (16-bit) |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  Total Frames | Payload Length|         Data Bytes...         |
+|  Sequence Num |  Total Chunks |         Data Bytes...         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
 | Byte Offset | Field | Type | Description |
 |---|---|---|---|
-| `0..1` | `Magic` | `uint16_be` | Fixed magic bytes: `0x41 0x54` (ASCII `"AT"`) |
-| `2` | `Msg Type` | `uint8` | `0x01`: Challenge, `0x02`: Submission, `0x03`: Receipt, `0x04`: Reconcile |
-| `3` | `Sequence Num`| `uint8` | 1-indexed fragment number (`1 <= seq <= total_frames`) |
-| `4` | `Total Frames`| `uint8` | Total fragments for message (`1 <= total <= 255`) |
-| `5` | `Payload Len` | `uint8` | Number of payload bytes in this fragment (`payload_len <= MTU - 9`) |
-| `6..N` | `Payload Chunk`| `bytes` | Binary chunk of UTF-8 or raw message payload |
+| `0` | `Magic Byte` | `uint8` | Fixed magic byte: `0xAC` (172) |
+| `1` | `Version Byte` | `uint8` | Protocol version: `0x01` (1) |
+| `2..3` | `Transaction ID` | `uint16_be` | 16-bit transaction identifier matching `eventId` hash |
+| `4` | `Sequence Num` | `uint8` | 1-indexed chunk number (`1 <= seq <= total_chunks`) |
+| `5` | `Total Chunks` | `uint8` | Total chunks for payload (`1 <= total <= 255`) |
+| `6..N` | `Payload Chunk` | `bytes` | Raw UTF-8 bytes of message chunk |
 
-### 3.3 Connection Bounds & Mathematical Guarantees
+### 3.2 Transport Sizing & Reassembly Guarantees
 - **Minimum MTU**: 23 bytes (effective ATT payload: 20 bytes).
 - **Usable chunk per frame at MTU 23**: `20 - 6 = 14 bytes`.
-- **Maximum Protocol Payload**: Fixed at `MAX_PAYLOAD_BYTES = 2048 bytes`.
+- **Maximum Protocol Payload**: `MAX_PAYLOAD_BYTES = 2048 bytes`.
 - **Maximum Frames Required**: `ceil(2048 / 14) = 147 frames`.
-- **1-Byte Sequence Representation**: $147 \le 255$, ensuring sequence counters will **never overflow** even under worst-case MTU 23 connections.
-- **Reassembly Buffer Bounds**: Maximum 2048 bytes allocated per transaction; transactions timeout after 5000 ms. Conflicting fragments (same sequence index with different payload bytes) trigger immediate abort.
+- **Sequence Representation**: `147 <= 255`, guaranteeing sequence counters never overflow.
+- **Reassembly Buffer**: Chunks are reassembled in strict sequence order `1..total`. Conflicting duplicate chunks abort the transaction. Transactions timeout after 15,000 ms.
+- **BLE Callback Decoupling**: Reassembly callbacks push completed messages to background queues (`bleSubmissionQueue`), ensuring non-blocking BLE interrupts.
 
 ---
 
 ## 4. Message Formats & Cryptographic Verification
 
 ### 4.1 Cryptographic Standards
-- **Asymmetric Key Algorithm**: NIST P-256 (`secp256r1` / `prime256v1`).
-- **Signature Algorithm**: ECDSA with SHA-256 (`SHA256withECDSA`).
-- **Signature Wire Format**: Raw IEEE P1363 64-byte `(r || s)` binary, Base64-encoded (88 chars).
-- **Public Key Wire Format**: Uncompressed NIST P-256 `SubjectPublicKeyInfo` (SPKI) DER Base64 (124 chars, prefix `MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE`).
+- **Elliptic Curve**: NIST P-256 (`secp256r1` / `prime256v1`).
+- **Signature Algorithm**: ECDSA with SHA-256 (`SHA256withECDSA`), enforcing low-S canonicality.
+- **Signature Formats**: Raw IEEE P1363 64-byte `(r || s)` Base64 (88 chars), or ASN.1 DER Base64 (70-72 bytes DER).
+- **Public Key Format**: Uncompressed NIST P-256 `SubjectPublicKeyInfo` (SPKI) DER Base64 (91 bytes DER, 124 chars Base64, prefix `MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...`).
 
 ---
 
 ### 4.2 Terminal Challenge Message
 Issued by ESP32 over Characteristic `0000ff11`.
 
-**Wire Format**:
-```
-ATTCHAL:v1|<terminal_id>|<session_id>|<challenge_nonce>|<monotonic_ms>|<sig_b64>
+**Payload (JSON)**:
+```json
+{
+  "version": 1,
+  "terminal_id": "TERM-LAB1-01",
+  "session_id": "sess_20261006",
+  "challenge": "<32-byte Base64 TRNG nonce>",
+  "terminal_time": 1791298800,
+  "time_confidence": "rtc" | "unsynchronized" | "estimated",
+  "course_code": "CSC401",
+  "signature": "<Terminal ECDSA P-256 Signature Base64>"
+}
 ```
 
-- `terminal_id`: Alphanumeric terminal identifier (e.g., `TERM-LAB1-01`).
-- `session_id`: UUID of the active lecture session.
-- `challenge_nonce`: 32-character hexadecimal random nonce generated via hardware TRNG.
-- `monotonic_ms`: Monotonic milliseconds since terminal boot (`millis()`).
-- `sig_b64`: Terminal ECDSA signature over canonical string:
-  ```
-  ATTCHALLENGE_V1:<terminal_id>:<session_id>:<challenge_nonce>:<monotonic_ms>
-  ```
-- **Monotonic Expiration**: Terminal strictly rejects any submission where elapsed monotonic time exceeds challenge generation time by more than 60,000 ms (60 seconds).
+**Canonical String for Challenge Signing**:
+```
+v1|challenge|{terminal_id}|{session_id}|{challenge}|{terminal_time}|{time_confidence}|{course_code}
+```
+
+**Security Rules**:
+- Challenge nonces are single-use and expire 60,000 ms (60s) after generation using monotonic elapsed time (`millis()`).
+- Signed using the provisioned terminal private key.
+- Verified by the mobile app against the institutional `TerminalTrustStore`.
 
 ---
 
 ### 4.3 Attendance Submission Message
 Transmitted by Mobile App over Characteristic `0000ff12`.
 
-**Wire Format**:
-```
-ATTSUB:v1|<event_id>|<student_id>|<matric_number>|<session_id>|<phone_timestamp_iso>|<terminal_id>|<challenge_nonce>|<sig_b64>
+**Payload (JSON)**:
+```json
+{
+  "version": 1,
+  "event_id": "c1f7b0a8-4e3d-4c8e-9d8a-6b2f4e8a1d2c",
+  "credential_id": "cred-p256-01",
+  "credential_version": "v1",
+  "algorithm": "ECDSA_P256_SHA256",
+  "student_id": "std-uuid-001",
+  "matric_number": "2021/1/12345CP",
+  "terminal_id": "TERM-LAB1-01",
+  "session_id": "sess_20261006",
+  "challenge": "<32-byte Base64 nonce>",
+  "timestamp": 1791298800,
+  "timestamp_source": "phone_os",
+  "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...",
+  "signature": "<Student ECDSA P-256 Signature Base64>"
+}
 ```
 
-- `event_id`: Unique UUID generated by mobile app prior to transmission.
-- `student_id`: Student UUID in AttendClass database.
-- `matric_number`: Institutional student matriculation number.
-- `session_id`: Verified session UUID matching active challenge.
-- `phone_timestamp_iso`: Provisional client timestamp (e.g., `2026-10-08T01:30:00Z`).
-- `terminal_id`: Terminal identifier matching active challenge.
-- `challenge_nonce`: Challenge nonce received from terminal.
-- `sig_b64`: Student device ECDSA signature over canonical string:
-  ```
-  ATTENDANCE_V1:<event_id>:<student_id>:<matric_number>:<session_id>:<phone_timestamp_iso>:<terminal_id>:<challenge_nonce>
-  ```
+**Canonical String for Submission Signing**:
+```
+v1|submission|{event_id}|{credential_id}|{credential_version}|{algorithm}|{student_id}|{matric_number}|{terminal_id}|{session_id}|{challenge}|{timestamp}|{timestamp_source}
+```
+
+**Security Rules**:
+- Terminal validates `terminal_id` matches its own identity.
+- Terminal validates `challenge` matches an active unexpired challenge nonce.
+- Terminal looks up student in cached `/enrolled_keys.csv` and verifies `public_key` matches the authorized public key.
+- Terminal verifies the ECDSA signature via mbedtls before recording attendance.
 
 ---
 
 ### 4.4 Terminal Acknowledgement / Receipt Message
-Emitted by ESP32 over Characteristic `0000ff13` upon writing to SD card.
+Issued by ESP32 over Characteristic `0000ff13` ONLY after successful SD write and flush.
 
-**Wire Format**:
-```
-ATTACK:v1|<event_id>|<status>|<terminal_id>|<terminal_ts>|<sig_b64>
+**Payload (JSON)**:
+```json
+{
+  "version": 1,
+  "event_id": "c1f7b0a8-4e3d-4c8e-9d8a-6b2f4e8a1d2c",
+  "terminal_id": "TERM-LAB1-01",
+  "session_id": "sess_20261006",
+  "submission_digest": "<SHA-256 Hex of Canonical Submission>",
+  "status": "DURABLY_SAVED",
+  "sd_persisted": true,
+  "record_index": 142,
+  "saved_at": "2026-10-08T09:30:00Z",
+  "signature": "<Terminal ECDSA P-256 Signature Base64>",
+  "error_code": null
+}
 ```
 
-- `event_id`: UUID matching the submission.
-- `status`: One of the following terminal evaluation statuses:
-  * `RECORDED_SD`: Valid signature; record successfully flushed to SD.
-  * `DUPLICATE_SD`: Identical event previously recorded; acknowledged.
-  * `REJECTED_VERIFICATION_FAILED`: ECDSA verification failed or key not enrolled.
-  * `REJECTED_SD_FAILURE`: SD card unmounted or I/O write error.
-  * `REJECTED_EXPIRED_CHALLENGE`: Challenge expired (> 60s).
-- `terminal_id`: Terminal identifier.
-- `terminal_ts`: Terminal hardware timestamp (NTP epoch or `BOOT+monotonic_ms`).
-- `sig_b64`: Terminal ECDSA signature over canonical string:
-  ```
-  ATTRECEIPT_V1:<event_id>:<status>:<terminal_id>:<terminal_ts>
-  ```
+**Canonical String for Receipt Signing**:
+```
+v1|receipt|{event_id}|{terminal_id}|{session_id}|{submission_digest}|{status}|{sd_persisted}|{record_index}|{saved_at}
+```
+
+**Persistence Semantics**:
+- Emitted ONLY after the complete record is written and flushed to `/attendance_offline.csv` on SD and indexed in `/event_index.csv`.
+- If SD write fails, status is `REJECTED`, `sd_persisted: false`, `error_code: "SD_WRITE_FAILURE"`.
 
 ---
 
-### 4.5 Terminal Disconnect Reconciliation Request
-Transmitted by Mobile App over Characteristic `0000ff12` if connection drops before receipt is received.
+### 4.5 Disconnect Reconciliation Query
+Transmitted by Mobile App over Characteristic `0000ff12` upon reconnecting after a dropped connection.
 
-**Wire Format**:
+**Payload (String)**:
 ```
-ATTREC_REQ:v1|<event_id>|<student_id>|<matric_number>
+v1|reconcile|{eventId}|{studentId}
 ```
-Terminal checks SD event index:
-- If `event_id` exists, terminal responds with the cached signed `ATTACK:v1` receipt.
-- If `event_id` does not exist, terminal returns `ATTACK:v1|<event_id>|NOT_FOUND|...`.
+
+**Terminal Handling**:
+- Scans `/event_index.csv` for `eventId`.
+- If found: Returns the cached signed `DURABLY_SAVED` receipt.
+- If not found: Returns `{ "status": "REJECTED", "sd_persisted": false, "error_code": "EVENT_NOT_FOUND" }`.
 
 ---
 
-## 5. Mobile Receipt State Machine
+## 5. Offline Storage & Outbox Cloud Synchronization
 
-The mobile app persists attendance events with explicit lifecycle states:
-
+### 5.1 Storage Layout on SD Card
 ```
-[Start Check-in]
-       │
-       ▼
-[Pre-persist: SUBMISSION_OUTCOME_UNKNOWN] (Durable storage on phone)
-       │
-       ▼ (BLE Transmission)
-[Receive ATTACK:v1 RECORDED_SD]
-       │
-       ▼
-[Update: TERMINAL_CONFIRMED_SD] (Durable on phone, verified terminal signature)
-       │
-       ▼ (Network connection restored)
-[Cloud Reconciliation Sync]
-       │
-       ├─────────────────────────────────┐
-       ▼                                 ▼
-[CLOUD_SYNC_PENDING]             [CLOUD_SYNC_CONFIRMED]
-(Terminal syncing batch)         (Authoritative DB attendance_log confirmed)
+SD_ROOT/
+├── attendance.csv           # Legacy 2FA attendance (Card + Fingerprint)
+├── enrollment.csv           # Legacy student biometric onboarding
+├── attendance_offline.csv   # Signed offline BLE attendance records (16 columns)
+├── event_index.csv          # Event index: event_id, matric, digest, saved_at, sig
+├── sync_checkpoint.txt      # Persistent outbox line cursor
+├── rejected_records.csv     # Archive of records rejected by cloud backend
+├── enrolled_keys.csv        # Cached authorized student public keys
+└── terminal_key.bin         # Provisioned terminal private scalar (32 bytes)
 ```
 
-> **Critical Safety Rule**: The mobile app NEVER presents an SD receipt as proof of cloud ingestion. The UI displays **"Confirmed on Terminal (Pending Cloud Sync)"** until authoritative verification is completed.
+### 5.2 Offline Attendance CSV Schema (16 Columns)
+```
+event_id,student_id,matric_number,terminal_id,session_id,phone_timestamp,terminal_saved_at,public_key,signature,challenge,timestamp_source,credential_id,credential_version,algorithm,submission_digest,terminal_receipt_signature
+```
+
+### 5.3 Batch Sync & Checkpoint Advancement
+- Terminals sync batches of up to 10 records at a time.
+- The cloud backend returns explicit per-record statuses: `ACCEPTED`, `DUPLICATE`, `REJECTED`, `RETRYABLE`.
+- Terminal archives `REJECTED` records to `/rejected_records.csv` with the error reason.
+- Terminal advances `sync_checkpoint.txt` only for acknowledged records, pausing if a `RETRYABLE` failure occurs.
+- Records appended during synchronization are preserved.
+- Credential refresh runs via `x-sync-action: refresh_credentials` before attendance records exist, updating `/enrolled_keys.csv` atomically.
 
 ---
 
-## 6. Error Codes and Retry Policies
+## 6. Backend Trust & Revoked Device Policy
 
-| Error Code | Layer | Meaning | Mobile Action |
-|---|---|---|---|
-| `CHALLENGE_TIMEOUT` | Mobile | Terminal challenge was not received within 10s | Abort & retry discovery |
-| `CHALLENGE_SIG_INVALID` | Mobile | Terminal signature does not match trusted key | Refuse transmission; untrusted device |
-| `CHALLENGE_EXPIRED` | Terminal | Monotonic 60s elapsed before submission received | Request fresh challenge |
-| `STUDENT_NOT_ENROLLED` | Terminal | Student public key not found in SD `/enrolled_keys.csv` | Reject with error; prompt student |
-| `SIG_VERIFY_FAIL` | Terminal | mbedtls ECDSA verification failed | Reject submission |
-| `EVENT_ID_CONFLICT` | Terminal/Cloud | Reused `event_id` with differing payload | Permanently rejected |
-| `SD_WRITE_FAIL` | Terminal | SD hardware write/flush error | Terminal displays alert; retryable |
-| `DEVICE_REVOKED_PRIOR_TO_SYNC` | Cloud | Student device revoked before terminal recorded attendance | Permanently rejected |
+- When evaluating delayed records from revoked student devices:
+  * Provisional phone timestamps (`timestamp_source: 'phone_os'`) are not trusted.
+  * Records must provide a `terminal_saved_at` timestamp.
+  * The terminal receipt signature over `terminal_saved_at` and `submission_digest` is cryptographically verified against the terminal's registered public key in `devices`.
+  * If the receipt signature is missing or invalid, the record is permanently rejected with `DEVICE_REVOKED_PRIOR_TO_SYNC`.
+  * If verified, `terminal_saved_at` is compared against `revoked_at`. If `terminal_saved_at < revoked_at`, the record is `ACCEPTED`; otherwise, `REJECTED`.

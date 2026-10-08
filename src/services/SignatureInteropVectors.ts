@@ -61,4 +61,30 @@ export const SIGNATURE_INTEROP_VECTORS: SignatureInteropVector[] = [
       'cK1DYKQfGeceeJTkVMS3Uhn/ViCasfMbu0XIyzsmK3drYvr228g50rogqwSbw5vJvZ9TMwd6Jp/0rdSZIhcvoQ==',
     expectedValid: false,
   },
+  {
+    description: 'Valid Terminal ECDSA P-256 signature over canonical receipt',
+    canonicalMessage:
+      'v1|receipt|evt-test-101|TERM_01|sess_20261006|a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90|DURABLY_SAVED|true|1|1791298820',
+    privateKeyHex: '',
+    publicKeySpkiBase64:
+      'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIpQZEkMmtk4hg2CtsANkXElU27oPtSd0reFbhW0qx0YNYmcIqhk2a2B/wfyCD1O72GAcPcwLGoQE9M/tmGWlTA==',
+    asn1DerSignatureBase64:
+      'MEUCIQDf+y1LyRvxp9T0fASRmhHauqMSMw1W2+vOtbCXXHF2lAIgImp4yVE2cAA6L/OCgJ9gZozwKKkS+lpkof2rp+nJCg0=',
+    compactP1363SignatureBase64:
+      '3/stS8kb8afU9HwEkZoR2rqjEjMNVtvrzrWwl1xxdpQianjJUTZwADov84KAn2BmjPAoqRL6WmSh/aun6ckKDQ==',
+    expectedValid: true,
+  },
+  {
+    description: 'Tampered terminal receipt canonical message must fail verification',
+    canonicalMessage:
+      'v1|receipt|evt-test-101|TERM_01|sess_20261006|a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90|DURABLY_SAVED|true|1|1799999999',
+    privateKeyHex: '',
+    publicKeySpkiBase64:
+      'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIpQZEkMmtk4hg2CtsANkXElU27oPtSd0reFbhW0qx0YNYmcIqhk2a2B/wfyCD1O72GAcPcwLGoQE9M/tmGWlTA==',
+    asn1DerSignatureBase64:
+      'MEUCIQDf+y1LyRvxp9T0fASRmhHauqMSMw1W2+vOtbCXXHF2lAIgImp4yVE2cAA6L/OCgJ9gZozwKKkS+lpkof2rp+nJCg0=',
+    compactP1363SignatureBase64:
+      '3/stS8kb8afU9HwEkZoR2rqjEjMNVtvrzrWwl1xxdpQianjJUTZwADov84KAn2BmjPAoqRL6WmSh/aun6ckKDQ==',
+    expectedValid: false,
+  },
 ];

@@ -1,5 +1,5 @@
 import { Buffer } from 'buffer';
-import { p256 } from '@noble/curves/nist.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { TerminalAckPayload } from './AttendanceProtocol';
 import { DeviceSecurityService } from './DeviceSecurityService';
 import { DiagnosticLogger } from './DiagnosticLogger';
@@ -116,7 +116,7 @@ export class TerminalTrustStore {
    */
   public static computeSubmissionDigest(canonicalSubmission: string): string {
     const raw = Buffer.from(canonicalSubmission, 'utf-8');
-    const digest = (p256 as any).hash(raw);
+    const digest = sha256(raw);
     return Buffer.from(digest).toString('hex');
   }
 

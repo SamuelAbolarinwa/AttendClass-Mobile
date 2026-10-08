@@ -237,31 +237,24 @@ export class AttendanceManager {
         };
       }
 
-      // ── Step 8: Submit and await durable SD persistence ACK ───────────────
+      // ── Step 8: Pre-persist event identity and recovery state BEFORE transmission ───────────
+      // Guarantees an app crash, disconnect, or power loss cannot generate a new duplicate eventId
+      const pendingRec: PendingReconciliationRecord = {
+        eventId: submission.event_id,
+        accountId: params.accountId,
+        studentId: params.studentId,
+        matricNumber: params.matricNumber,
+        terminalId: submission.terminal_id,
+        sessionId: submission.session_id,
+        submissionPayload: submission,
+        createdAtIso: new Date().toISOString(),
+      };
+      await AttendanceReceiptStorage.savePendingReconciliation(pendingRec);
+
       notify('SUBMITTING_ATTENDANCE', 'Sending signed attendance response...');
       notify('AWAITING_SD_ACK', 'Awaiting terminal durable save confirmation...');
 
-      let ack;
-      try {
-        ack = await this.transport.submitAttendanceAndAwaitAck(connected, submission, 12000);
-      } catch (submitErr: unknown) {
-        const errorMsg = submitErr instanceof Error ? submitErr.message : String(submitErr);
-        if (errorMsg.includes('SUBMISSION_PENDING_RECONCILIATION')) {
-          // Store pending reconciliation record so retry uses the exact same eventId
-          const pendingRec: PendingReconciliationRecord = {
-            eventId: submission.event_id,
-            accountId: params.accountId,
-            studentId: params.studentId,
-            matricNumber: params.matricNumber,
-            terminalId: submission.terminal_id,
-            sessionId: submission.session_id,
-            submissionPayload: submission,
-            createdAtIso: new Date().toISOString(),
-          };
-          await AttendanceReceiptStorage.savePendingReconciliation(pendingRec);
-        }
-        throw submitErr;
-      }
+      const ack = await this.transport.submitAttendanceAndAwaitAck(connected, submission, 12000);
 
       // ── Step 9: Authenticate terminal durable receipt ─────────────────────
       notify('VERIFYING_RECEIPT', 'Authenticating terminal durable receipt...');
@@ -302,7 +295,7 @@ export class AttendanceManager {
         sdRecordIndex: ack.record_index,
         terminalReceiptSignature: ack.signature,
         submissionDigest,
-        status: 'DEVICE_CONFIRMED',
+        status: 'TERMINAL_CONFIRMED_SD',
         lagosDate: AttendanceReceiptStorage.getLagosDate(submission.timestamp),
       };
 

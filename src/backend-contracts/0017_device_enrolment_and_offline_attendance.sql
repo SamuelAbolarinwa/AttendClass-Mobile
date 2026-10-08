@@ -26,6 +26,18 @@ CREATE INDEX IF NOT EXISTS idx_device_activation_hash ON device_activation_codes
 ALTER TABLE device_activation_codes ENABLE ROW LEVEL SECURITY;
 CREATE POLICY device_activation_codes_admin_all ON device_activation_codes FOR ALL USING (true) WITH CHECK (true);
 
+-- ── 1b. Per-account durable failed activation attempt log ───────────────────
+CREATE TABLE IF NOT EXISTS device_activation_attempt_log (
+  id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id      uuid        NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  is_successful   boolean     NOT NULL DEFAULT false,
+  attempt_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_activation_attempt_student ON device_activation_attempt_log(student_id, attempt_at DESC);
+ALTER TABLE device_activation_attempt_log ENABLE ROW LEVEL SECURITY;
+CREATE POLICY device_activation_attempt_log_all ON device_activation_attempt_log FOR ALL USING (true) WITH CHECK (true);
+
 -- ── 2. Add extra columns to student_devices ─────────────────────────────────
 ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS device_name text;
 ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS device_fingerprint text;
@@ -36,6 +48,11 @@ ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS credential_id text;
 ALTER TABLE student_devices ADD COLUMN IF NOT EXISTS credential_version text DEFAULT 'v1';
 
 CREATE INDEX IF NOT EXISTS idx_student_devices_student_active ON student_devices(student_id) WHERE revoked_at IS NULL;
+
+-- ── 2b. Add terminal public key and provisioning columns to devices ─────────
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS public_key text;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS algorithm text NOT NULL DEFAULT 'ECDSA_P256_SHA256';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;
 
 -- ── 3. Add offline and idempotency columns to attendance_logs ───────────────
 ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS event_id uuid UNIQUE;
@@ -145,6 +162,7 @@ DECLARE
   _code_record device_activation_codes%ROWTYPE;
   _incoming_hash text;
   _new_device_id uuid;
+  _recent_failed integer;
 BEGIN
   -- Verify student session
   SELECT * INTO _sess FROM active_sessions WHERE token = p_token AND expires_at > now();
@@ -157,12 +175,25 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'error', 'Account not found');
   END IF;
 
+  -- Durable rate limiting per student account (5 failures in 30 minutes)
+  SELECT count(*) INTO _recent_failed
+  FROM device_activation_attempt_log
+  WHERE student_id = _student.id
+    AND is_successful = false
+    AND attempt_at > now() - interval '30 minutes';
+
+  IF _recent_failed >= 5 THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Too many failed activation attempts. Account is locked out for 30 minutes.');
+  END IF;
+
   IF p_activation_code IS NULL OR length(trim(p_activation_code)) != 8 THEN
+    INSERT INTO device_activation_attempt_log (student_id, is_successful) VALUES (_student.id, false);
     RETURN jsonb_build_object('ok', false, 'error', 'Invalid activation code format (expected 8 alphanumeric characters)');
   END IF;
 
   -- Validate uncompressed NIST P-256 (secp256r1) SPKI Base64 structure (exactly 124 chars, standard ASN.1 prefix)
   IF p_device_public_key IS NULL OR length(trim(p_device_public_key)) != 124 OR NOT (p_device_public_key LIKE 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE%') THEN
+    INSERT INTO device_activation_attempt_log (student_id, is_successful) VALUES (_student.id, false);
     RETURN jsonb_build_object('ok', false, 'error', 'Invalid device public key: Must be valid uncompressed NIST P-256 (secp256r1) SPKI format');
   END IF;
 
@@ -179,11 +210,13 @@ BEGIN
   FOR UPDATE;
 
   IF NOT FOUND THEN
+    INSERT INTO device_activation_attempt_log (student_id, is_successful) VALUES (_student.id, false);
     RETURN jsonb_build_object('ok', false, 'error', 'No active activation code found. Please request a new code from an administrator.');
   END IF;
 
   IF _code_record.attempts >= _code_record.max_attempts THEN
     UPDATE device_activation_codes SET consumed_at = now() WHERE id = _code_record.id;
+    INSERT INTO device_activation_attempt_log (student_id, is_successful) VALUES (_student.id, false);
     RETURN jsonb_build_object('ok', false, 'error', 'Maximum activation attempts exceeded. Code has been invalidated.');
   END IF;
 
@@ -192,6 +225,8 @@ BEGIN
     SET attempts = attempts + 1,
         consumed_at = CASE WHEN attempts + 1 >= max_attempts THEN now() ELSE NULL END
     WHERE id = _code_record.id;
+
+    INSERT INTO device_activation_attempt_log (student_id, is_successful) VALUES (_student.id, false);
 
     RETURN jsonb_build_object(
       'ok', false,
@@ -206,6 +241,9 @@ BEGIN
   UPDATE device_activation_codes
   SET consumed_at = now()
   WHERE id = _code_record.id;
+
+  -- Log successful attempt
+  INSERT INTO device_activation_attempt_log (student_id, is_successful) VALUES (_student.id, true);
 
   -- Revoke any previously active device for this student (Device Replacement Policy)
   UPDATE student_devices

@@ -63,7 +63,7 @@ export interface BleFramePacket {
 }
 
 export class AttendanceProtocol {
-  public static readonly MAX_PAYLOAD_BYTES = 4096;
+  public static readonly MAX_PAYLOAD_BYTES = 2048;
 
   /**
    * Validate that a field value does not contain delimiter characters or invalid control codes.
@@ -329,6 +329,26 @@ export class AttendanceProtocol {
     }
     return hash === 0 ? 1 : hash;
   }
+  /**
+   * Build canonical string for terminal reconciliation query.
+   * Format: v1|reconcile|{eventId}|{studentId}
+   */
+  public static buildReconciliationCanonicalString(eventId: string, studentId: string): string {
+    this.validateField('eventId', eventId);
+    this.validateField('studentId', studentId);
+    return ['v1', 'reconcile', eventId, studentId].join('|');
+  }
+
+  /**
+   * Parse reconciliation query string.
+   */
+  public static parseReconciliationRequest(raw: string): { eventId: string; studentId: string } {
+    const parts = raw.trim().split('|');
+    if (parts.length < 4 || parts[0] !== 'v1' || parts[1] !== 'reconcile') {
+      throw new Error('MALFORMED_RECONCILIATION_REQUEST: Invalid format');
+    }
+    return { eventId: parts[2], studentId: parts[3] };
+  }
 }
 
 /**
@@ -405,6 +425,14 @@ export class FrameReassembler {
     total: number,
     chunk: Uint8Array,
   ): { complete: boolean; payload?: string; payloadBytes?: Uint8Array } {
+    if (total < 1 || total > 255) {
+      throw new Error(`INVALID_FRAME_SEQUENCE: Total chunks ${total} must be between 1 and 255`);
+    }
+
+    if (seq < 1 || seq > total) {
+      throw new Error(`INVALID_FRAME_SEQUENCE: Sequence ${seq} out of bounds for total ${total}`);
+    }
+
     if (this.txId === null) {
       this.txId = txId;
       this.totalExpected = total;
@@ -412,7 +440,31 @@ export class FrameReassembler {
       throw new Error(`TRANSACTION_MISMATCH: Frame txId=${txId} does not match active txId=${this.txId}`);
     }
 
-    // Store chunk (idempotently handles duplicate chunks)
+    // Check duplicate chunk
+    const existing = this.chunks.get(seq);
+    if (existing) {
+      if (existing.length !== chunk.length) {
+        throw new Error(`CONFLICTING_DUPLICATE_FRAGMENT: Received mismatched chunk length for sequence ${seq}`);
+      }
+      for (let b = 0; b < existing.length; b++) {
+        if (existing[b] !== chunk[b]) {
+          throw new Error(`CONFLICTING_DUPLICATE_FRAGMENT: Received conflicting bytes for sequence ${seq}`);
+        }
+      }
+      return { complete: false };
+    }
+
+    // Bound memory consumption
+    let currentBytes = 0;
+    for (const c of this.chunks.values()) {
+      currentBytes += c.length;
+    }
+    if (currentBytes + chunk.length > AttendanceProtocol.MAX_PAYLOAD_BYTES) {
+      throw new Error(
+        `PAYLOAD_EXCEEDS_LIMIT: Reassembly buffer exceeded maximum message size of ${AttendanceProtocol.MAX_PAYLOAD_BYTES} bytes`,
+      );
+    }
+
     this.chunks.set(seq, chunk);
 
     if (this.chunks.size === this.totalExpected) {

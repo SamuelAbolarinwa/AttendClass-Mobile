@@ -98,13 +98,13 @@ android {
             keyPassword 'android'
         }
         release {
-            if (System.getenv("RELEASE_KEYSTORE_PASSWORD")) {
+            if (System.getenv("RELEASE_KEYSTORE_PASSWORD") && file('release.keystore').exists()) {
                 storeFile file('release.keystore')
                 storePassword System.getenv("RELEASE_KEYSTORE_PASSWORD")
                 keyAlias System.getenv("RELEASE_KEY_ALIAS")
                 keyPassword System.getenv("RELEASE_KEY_PASSWORD")
             } else {
-                // Fallback to debug keystore if secrets are missing
+                // Fallback to debug keystore if secrets or keystore file are missing
                 storeFile file('debug.keystore')
                 storePassword 'android'
                 keyAlias 'androiddebugkey'

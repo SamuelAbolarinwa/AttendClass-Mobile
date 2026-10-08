@@ -2,6 +2,14 @@ import * as Keychain from 'react-native-keychain';
 import { AttendanceSubmissionPayload } from './AttendanceProtocol';
 import { DiagnosticLogger } from './DiagnosticLogger';
 
+export type AttendanceReceiptStatus =
+  | 'SUBMISSION_OUTCOME_UNKNOWN'
+  | 'TERMINAL_CONFIRMED_SD'
+  | 'CLOUD_SYNC_PENDING'
+  | 'CLOUD_SYNC_CONFIRMED'
+  | 'DEVICE_CONFIRMED'
+  | 'CLOUD_SYNCHRONIZED';
+
 export interface AttendanceReceipt {
   eventId: string;
   accountId: string;
@@ -18,7 +26,7 @@ export interface AttendanceReceipt {
   sdRecordIndex?: number;
   terminalReceiptSignature?: string;
   submissionDigest?: string;
-  status: 'DEVICE_CONFIRMED' | 'CLOUD_SYNCHRONIZED';
+  status: AttendanceReceiptStatus;
   cloudUploadedAtIso?: string;
   lagosDate: string; // YYYY-MM-DD strictly calculated for Africa/Lagos
 }

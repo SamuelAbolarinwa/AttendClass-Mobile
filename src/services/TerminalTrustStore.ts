@@ -38,13 +38,44 @@ export interface TerminalReceiptPayload {
 }
 
 export class TerminalTrustStore {
+  public static readonly DEFAULT_TERMINALS: TerminalTrustRecord[] = [
+    {
+      terminalId: 'ESP32-LT101',
+      publicKeyDerBase64:
+        'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE77edo9o0tvejrv0kEzHJqePFlVqYYP8fg9lqyJOMe8ONKuImJsIgYXA6VNK0KTMWg/OfiBwipkkdjXnra3aKRg==',
+      institution: 'AttendClass University',
+      validFromIso: '2026-01-01T00:00:00Z',
+      validUntilIso: '2030-01-01T00:00:00Z',
+    },
+    {
+      terminalId: 'TERM-LAB1-01',
+      publicKeyDerBase64:
+        'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE77edo9o0tvejrv0kEzHJqePFlVqYYP8fg9lqyJOMe8ONKuImJsIgYXA6VNK0KTMWg/OfiBwipkkdjXnra3aKRg==',
+      institution: 'AttendClass University',
+      validFromIso: '2026-01-01T00:00:00Z',
+      validUntilIso: '2030-01-01T00:00:00Z',
+    },
+  ];
+
   // Static registry of authorized institution terminals
   // In production, synced securely from Supabase device registry or institution root cert
-  private static trustedTerminals = new Map<string, TerminalTrustRecord>();
+  private static trustedTerminals = new Map<string, TerminalTrustRecord>(
+    TerminalTrustStore.DEFAULT_TERMINALS.map((t) => [t.terminalId, t]),
+  );
 
   // In-memory replay buffer for seen challenge nonces: nonce -> timestamp (ms)
   private static seenChallengeNonces = new Map<string, number>();
   private static readonly CHALLENGE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+
+  public static initDefaults(): void {
+    for (const t of this.DEFAULT_TERMINALS) {
+      this.trustedTerminals.set(t.terminalId, t);
+    }
+  }
+
+  public static getAllTrustedTerminals(): TerminalTrustRecord[] {
+    return Array.from(this.trustedTerminals.values());
+  }
 
   /**
    * Register or update an authorized terminal key in trust store.

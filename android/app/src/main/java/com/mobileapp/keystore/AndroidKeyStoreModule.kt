@@ -144,9 +144,9 @@ class AndroidKeyStoreModule(private val reactContext: ReactApplicationContext) :
                     .setSubtitle(promptSubtitle)
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    promptInfoBuilder.setAllowedAuthenticators(
-                        BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
-                    )
+                    // Enforce strong biometrics (fingerprint/Class 3). A device PIN must not silently replace biometrics.
+                    promptInfoBuilder.setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                    promptInfoBuilder.setNegativeButtonText("Cancel")
                 } else {
                     @Suppress("DEPRECATION")
                     promptInfoBuilder.setNegativeButtonText("Cancel")
@@ -212,6 +212,29 @@ class AndroidKeyStoreModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(keyStore.containsAlias(alias))
         } catch (e: Exception) {
             promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun getPublicKey(alias: String, promise: Promise) {
+        try {
+            val cert = keyStore.getCertificate(alias)
+            if (cert != null) {
+                val pubKey = cert.publicKey
+                val pubKeyDerBase64 = Base64.encodeToString(pubKey.encoded, Base64.NO_WRAP)
+                promise.resolve(pubKeyDerBase64)
+                return
+            }
+            val privateKeyEntry = keyStore.getEntry(alias, null) as? KeyStore.PrivateKeyEntry
+            if (privateKeyEntry != null) {
+                val pubKey = privateKeyEntry.certificate.publicKey
+                val pubKeyDerBase64 = Base64.encodeToString(pubKey.encoded, Base64.NO_WRAP)
+                promise.resolve(pubKeyDerBase64)
+                return
+            }
+            promise.reject("KEY_NOT_FOUND", "No key or certificate found for alias: $alias")
+        } catch (e: Exception) {
+            promise.reject("GET_PUBKEY_FAILED", e.message, e)
         }
     }
 

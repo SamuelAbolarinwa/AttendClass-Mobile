@@ -11,55 +11,82 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '../contexts/AuthContext';
-import { AttendanceManager, AttendanceFlowState } from '../services/AttendanceManager';
+import { AttendanceService } from '../attendance/AttendanceService';
+import { AttendanceState, StateMachineContext } from '../attendance/AttendanceStateMachine';
 import { AttendanceReceipt } from '../services/AttendanceReceiptStorage';
+import { ClassroomQRPayload } from '../qr/QRPayload';
 import { T } from '../theme/tokens';
 
-export default function CheckInScreen({ navigation }: any) {
+export default function CheckInScreen({ navigation, route }: any) {
   const { account, isDeviceEnrolled } = useAuth();
-  const [flowState, setFlowState] = useState<AttendanceFlowState>('IDLE');
-  const [statusMessage, setStatusMessage] = useState('Ready to check in');
+  const qrPayload = route?.params?.qrPayload as ClassroomQRPayload | undefined;
+
+  const [state, setState] = useState<AttendanceState>(qrPayload ? 'QR_VALIDATED' : 'READY');
+  const [statusMessage, setStatusMessage] = useState(
+    qrPayload ? 'Classroom QR validated. Ready to connect.' : 'Ready to scan classroom QR',
+  );
+  const [context, setContext] = useState<StateMachineContext>(qrPayload ? { qrPayload } : {});
   const [receipt, setReceipt] = useState<AttendanceReceipt | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  const attendanceManagerRef = useRef<AttendanceManager | null>(null);
+  const attendanceServiceRef = useRef<AttendanceService | null>(null);
 
   useEffect(() => {
-    attendanceManagerRef.current = new AttendanceManager();
+    attendanceServiceRef.current = new AttendanceService();
     return () => {
-      attendanceManagerRef.current?.destroy();
+      attendanceServiceRef.current?.destroy();
     };
   }, []);
 
-  const handleStartAttendance = useCallback(async () => {
-    if (!account) return;
-    setIsProcessing(true);
-    setErrorMessage(null);
-    setReceipt(null);
+  const runAttendanceWithPayload = useCallback(
+    async (payload: ClassroomQRPayload) => {
+      if (!account) return;
+      setIsProcessing(true);
+      setErrorMessage(null);
+      setReceipt(null);
 
-    const manager = attendanceManagerRef.current || new AttendanceManager();
+      const service = attendanceServiceRef.current || new AttendanceService();
 
-    const result = await manager.executeAttendance({
-      accountId: account.id,
-      studentId: account.id,
-      matricNumber: account.matric_number || account.identifier,
-      rssiThreshold: -85,
-      onStateChange: (state, message) => {
-        setFlowState(state);
-        setStatusMessage(message);
-      },
-    });
+      const result = await service.executeCheckIn({
+        accountId: account.id,
+        studentId: account.id,
+        matricNumber: account.matric_number || account.identifier,
+        qrPayload: payload,
+        rssiThreshold: -90,
+        onStateChange: (newState, message, newCtx) => {
+          setState(newState);
+          setStatusMessage(message);
+          setContext(newCtx);
+        },
+      });
 
-    setIsProcessing(false);
-    setFlowState(result.state);
+      setIsProcessing(false);
+      setState(result.state);
 
-    if (result.success && result.receipt) {
-      setReceipt(result.receipt);
-    } else if (!result.success) {
-      setErrorMessage(result.errorMessage || 'Check-in failed');
+      if (result.success && result.receipt) {
+        setReceipt(result.receipt);
+      } else if (!result.success) {
+        setErrorMessage(result.errorMessage || 'Check-in failed');
+      }
+    },
+    [account],
+  );
+
+  // Auto-start check-in when screen mounts with a valid scanned QR payload
+  useEffect(() => {
+    if (qrPayload && !isProcessing && state === 'QR_VALIDATED') {
+      runAttendanceWithPayload(qrPayload);
     }
-  }, [account]);
+  }, [qrPayload, isProcessing, state, runAttendanceWithPayload]);
+
+  const handleRetry = () => {
+    if (qrPayload) {
+      runAttendanceWithPayload(qrPayload);
+    } else {
+      navigation.navigate('QRScanner');
+    }
+  };
 
   const renderContent = () => {
     if (!isDeviceEnrolled) {
@@ -68,7 +95,7 @@ export default function CheckInScreen({ navigation }: any) {
           <Text style={styles.icon}>📱</Text>
           <Text style={styles.title}>Device Enrolment Required</Text>
           <Text style={styles.description}>
-            This phone has not been enrolled as an authorised device yet. Please request a one-time activation code from your course administrator to link this phone.
+            This phone is not enrolled as your authorised attendance device. Attendance requires an authorised phone with hardware-backed key protection.
           </Text>
           <TouchableOpacity
             style={styles.primaryBtn}
@@ -80,13 +107,31 @@ export default function CheckInScreen({ navigation }: any) {
       );
     }
 
-    if (flowState === 'SUCCESS' && receipt) {
+    if (!qrPayload && state === 'READY') {
+      return (
+        <View style={styles.card}>
+          <Text style={styles.icon}>📷</Text>
+          <Text style={styles.title}>Scan Classroom QR</Text>
+          <Text style={styles.description}>
+            Each classroom has a permanent QR code on the wall or attendance box. Scan the code to connect to the classroom terminal over Bluetooth.
+          </Text>
+          <TouchableOpacity
+            style={styles.primaryBtn}
+            onPress={() => navigation.navigate('QRScanner')}
+          >
+            <Text style={styles.primaryBtnText}>Scan Attendance QR</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+
+    if (state === 'SUCCESS' && receipt) {
       return (
         <View style={styles.card}>
           <Text style={styles.icon}>✅</Text>
           <Text style={styles.title}>Attendance Confirmed</Text>
           <Text style={styles.description}>
-            Your attendance has been cryptographically signed and durably persisted on the terminal SD card.
+            Your attendance has been cryptographically signed using your phone&apos;s fingerprint and durably saved by the classroom terminal.
           </Text>
 
           <View style={styles.receiptBox}>
@@ -102,14 +147,38 @@ export default function CheckInScreen({ navigation }: any) {
               <Text style={styles.receiptLabel}>Terminal:</Text>
               <Text style={styles.receiptValue}>{receipt.terminalId}</Text>
             </View>
+            {context.courseId ? (
+              <View style={styles.receiptRow}>
+                <Text style={styles.receiptLabel}>Course:</Text>
+                <Text style={styles.receiptValue}>{context.courseId}</Text>
+              </View>
+            ) : null}
+            {context.sessionId ? (
+              <View style={styles.receiptRow}>
+                <Text style={styles.receiptLabel}>Session ID:</Text>
+                <Text style={styles.receiptValue}>{context.sessionId}</Text>
+              </View>
+            ) : null}
             <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Date (Lagos):</Text>
+              <Text style={styles.receiptLabel}>Recorded Date:</Text>
               <Text style={styles.receiptValue}>{receipt.lagosDate}</Text>
             </View>
             <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>SD Persistence:</Text>
+              <Text style={styles.receiptLabel}>Official Time:</Text>
+              <Text style={styles.receiptValue}>
+                {receipt.terminalSavedAtIso
+                  ? new Date(receipt.terminalSavedAtIso).toLocaleTimeString([], {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                      second: '2-digit',
+                    })
+                  : receipt.attendanceTimeIso}
+              </Text>
+            </View>
+            <View style={styles.receiptRow}>
+              <Text style={styles.receiptLabel}>Receipt Status:</Text>
               <Text style={[styles.receiptValue, { color: T.colors.success }]}>
-                Verified (Record #{receipt.sdRecordIndex ?? 1})
+                ✓ Verified ESP32 Receipt
               </Text>
             </View>
             <View style={styles.receiptRow}>
@@ -122,25 +191,43 @@ export default function CheckInScreen({ navigation }: any) {
 
           <TouchableOpacity
             style={styles.primaryBtn}
-            onPress={() => navigation.goBack()}
+            onPress={() => navigation.navigate('Dashboard')}
           >
-            <Text style={styles.primaryBtnText}>Done</Text>
+            <Text style={styles.primaryBtnText}>Return to Dashboard</Text>
           </TouchableOpacity>
         </View>
       );
     }
 
-    if (flowState === 'ALREADY_LOGGED') {
+    if (state === 'ALREADY_RECORDED') {
       return (
         <View style={styles.card}>
           <Text style={styles.icon}>📋</Text>
-          <Text style={styles.title}>Already Checked In</Text>
+          <Text style={styles.title}>Attendance Already Recorded</Text>
           <Text style={styles.description}>
-            Attendance for today ({receipt?.lagosDate || 'today'}) has already been recorded for this device.
+            Your attendance for this course session ({receipt?.lagosDate || 'today'}) has already been verified and durably recorded.
           </Text>
+          {receipt && (
+            <View style={styles.receiptBox}>
+              <View style={styles.receiptRow}>
+                <Text style={styles.receiptLabel}>Course:</Text>
+                <Text style={styles.receiptValue}>{context.courseId || 'Enrolled Course'}</Text>
+              </View>
+              <View style={styles.receiptRow}>
+                <Text style={styles.receiptLabel}>Terminal:</Text>
+                <Text style={styles.receiptValue}>{receipt.terminalId}</Text>
+              </View>
+              <View style={styles.receiptRow}>
+                <Text style={styles.receiptLabel}>Status:</Text>
+                <Text style={[styles.receiptValue, { color: T.colors.success }]}>
+                  Recorded &amp; Confirmed
+                </Text>
+              </View>
+            </View>
+          )}
           <TouchableOpacity
             style={styles.primaryBtn}
-            onPress={() => navigation.goBack()}
+            onPress={() => navigation.navigate('Dashboard')}
           >
             <Text style={styles.primaryBtnText}>Done</Text>
           </TouchableOpacity>
@@ -148,26 +235,23 @@ export default function CheckInScreen({ navigation }: any) {
       );
     }
 
-    if (flowState === 'FAILED') {
+    if (state === 'FAILED') {
       return (
         <View style={styles.card}>
           <Text style={styles.icon}>❌</Text>
           <Text style={styles.title}>Check-In Not Completed</Text>
           <View style={styles.errorBox}>
-            <Text style={styles.errorText}>{errorMessage}</Text>
+            <Text style={styles.errorText}>{errorMessage || 'An error occurred during verification.'}</Text>
           </View>
           <Text style={styles.helpText}>
-            Ensure you are near an authorized AttendClass terminal (ESP32) with Bluetooth turned on.
+            Ensure you are near the classroom attendance terminal with Bluetooth turned on.
           </Text>
-          <TouchableOpacity
-            style={styles.primaryBtn}
-            onPress={handleStartAttendance}
-          >
+          <TouchableOpacity style={styles.primaryBtn} onPress={handleRetry}>
             <Text style={styles.primaryBtnText}>Try Again</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={styles.outlineBtn}
-            onPress={() => navigation.goBack()}
+            onPress={() => navigation.navigate('Dashboard')}
           >
             <Text style={styles.outlineBtnText}>Cancel</Text>
           </TouchableOpacity>
@@ -180,21 +264,29 @@ export default function CheckInScreen({ navigation }: any) {
         <View style={styles.card}>
           <ActivityIndicator size="large" color={T.colors.primary} style={styles.spinner} />
           <Text style={styles.stateTitle}>
-            {flowState === 'SCANNING_TERMINAL' && 'Scanning for Terminal…'}
-            {flowState === 'CONNECTING_TERMINAL' && 'Connecting to Terminal…'}
-            {flowState === 'FETCHING_CHALLENGE' && 'Obtaining Challenge…'}
-            {flowState === 'LOCAL_APPROVAL' && 'Awaiting Authorisation…'}
-            {flowState === 'SUBMITTING_ATTENDANCE' && 'Sending Signed Check-in…'}
-            {flowState === 'AWAITING_SD_ACK' && 'Awaiting SD Persistence ACK…'}
-            {flowState === 'CHECKING_STATUS' && 'Checking Records…'}
+            {state === 'SEARCHING_DEVICE' && 'Searching for Terminal…'}
+            {state === 'CONNECTING_BLE' && 'Connecting to Terminal…'}
+            {state === 'WAITING_FOR_CHALLENGE' && 'Obtaining Challenge…'}
+            {state === 'VERIFYING_ESP' && 'Verifying Terminal…'}
+            {state === 'WAITING_FOR_BIOMETRIC' && 'Confirm Your Fingerprint…'}
+            {state === 'SIGNING_CHALLENGE' && 'Signing Challenge…'}
+            {state === 'SENDING_PROOF' && 'Sending Proof…'}
+            {state === 'WAITING_FOR_RESULT' && 'Saving Attendance…'}
+            {state === 'VERIFYING_RECEIPT' && 'Authenticating Receipt…'}
+            {state === 'RECOVERING_RESULT' && 'Recovering Attendance…'}
           </Text>
           <Text style={styles.stateSubtitle}>{statusMessage}</Text>
+          {context.courseId ? (
+            <View style={styles.courseTag}>
+              <Text style={styles.courseTagText}>Course: {context.courseId}</Text>
+            </View>
+          ) : null}
           <TouchableOpacity
             style={styles.cancelLink}
             onPress={() => {
-              attendanceManagerRef.current?.cancel();
+              attendanceServiceRef.current?.cancel();
               setIsProcessing(false);
-              setFlowState('IDLE');
+              setState('CANCELLED');
             }}
           >
             <Text style={styles.cancelLinkText}>Cancel</Text>
@@ -203,22 +295,7 @@ export default function CheckInScreen({ navigation }: any) {
       );
     }
 
-    // Default: IDLE state
-    return (
-      <View style={styles.card}>
-        <Text style={styles.icon}>📡</Text>
-        <Text style={styles.title}>Terminal Check-In</Text>
-        <Text style={styles.description}>
-          Hold your phone near the classroom AttendClass terminal. When connected, approve the transaction with your biometric or screen lock to sign your attendance.
-        </Text>
-        <TouchableOpacity
-          style={styles.primaryBtn}
-          onPress={handleStartAttendance}
-        >
-          <Text style={styles.primaryBtnText}>Start Check-In</Text>
-        </TouchableOpacity>
-      </View>
-    );
+    return null;
   };
 
   return (
@@ -228,7 +305,7 @@ export default function CheckInScreen({ navigation }: any) {
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
           <Text style={styles.backBtnText}>← Back</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Class Attendance</Text>
+        <Text style={styles.headerTitle}>Classroom Check-In</Text>
         <View style={styles.headerSpacer} />
       </View>
       <ScrollView contentContainerStyle={styles.scrollContent}>
@@ -258,122 +335,119 @@ const styles = StyleSheet.create({
     paddingHorizontal: T.spacing.sm,
   },
   backBtnText: {
+    fontSize: T.fontSize.sm,
     color: T.colors.primary,
-    fontSize: T.fontSize.base,
-    fontWeight: '600',
+    fontWeight: '700',
   },
   headerTitle: {
-    fontSize: T.fontSize.lg,
-    fontWeight: '700',
+    fontSize: T.fontSize.base,
+    fontWeight: '800',
     color: T.colors.text,
   },
   headerSpacer: {
-    width: 60,
+    width: 48,
   },
   scrollContent: {
-    flexGrow: 1,
     padding: T.spacing.lg,
     justifyContent: 'center',
+    flexGrow: 1,
   },
   card: {
     backgroundColor: T.colors.surface,
-    padding: T.spacing.xl,
     borderRadius: T.radius.xl,
+    padding: T.spacing.xl,
     alignItems: 'center',
     ...T.shadow.md,
   },
   icon: {
-    fontSize: 52,
+    fontSize: 54,
     marginBottom: T.spacing.md,
   },
   title: {
     fontSize: T.fontSize.xl,
     fontWeight: '800',
     color: T.colors.text,
-    textAlign: 'center',
     marginBottom: T.spacing.sm,
+    textAlign: 'center',
   },
   description: {
-    fontSize: T.fontSize.base,
+    fontSize: T.fontSize.sm,
     color: T.colors.textSecondary,
     textAlign: 'center',
-    lineHeight: 22,
-    marginBottom: T.spacing.xl,
+    marginBottom: T.spacing.lg,
+    lineHeight: 20,
   },
   spinner: {
-    marginBottom: T.spacing.lg,
+    marginVertical: T.spacing.lg,
   },
   stateTitle: {
     fontSize: T.fontSize.lg,
-    fontWeight: '700',
+    fontWeight: '800',
     color: T.colors.text,
-    textAlign: 'center',
     marginBottom: T.spacing.xs,
+    textAlign: 'center',
   },
   stateSubtitle: {
     fontSize: T.fontSize.sm,
     color: T.colors.textSecondary,
     textAlign: 'center',
-    marginBottom: T.spacing.xl,
+    marginBottom: T.spacing.md,
+  },
+  courseTag: {
+    backgroundColor: T.colors.primary100,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: T.radius.full,
+    marginBottom: T.spacing.md,
+  },
+  courseTagText: {
+    color: T.colors.primary,
+    fontWeight: '700',
+    fontSize: T.fontSize.xs,
+  },
+  cancelLink: {
+    paddingVertical: T.spacing.sm,
+    paddingHorizontal: T.spacing.md,
+  },
+  cancelLinkText: {
+    color: T.colors.textMuted,
+    fontSize: T.fontSize.sm,
+    fontWeight: '600',
   },
   receiptBox: {
     width: '100%',
     backgroundColor: T.colors.bg,
-    borderRadius: T.radius.md,
+    borderRadius: T.radius.lg,
     padding: T.spacing.md,
-    marginBottom: T.spacing.xl,
+    marginVertical: T.spacing.md,
     borderWidth: 1,
     borderColor: T.colors.border,
   },
   receiptRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    paddingVertical: 6,
-    borderBottomWidth: 1,
-    borderBottomColor: T.colors.border,
+    paddingVertical: 5,
   },
   receiptLabel: {
-    fontSize: T.fontSize.sm,
+    fontSize: T.fontSize.xs,
     color: T.colors.textSecondary,
-    fontWeight: '500',
+    fontWeight: '600',
   },
   receiptValue: {
-    fontSize: T.fontSize.sm,
+    fontSize: T.fontSize.xs,
     color: T.colors.text,
     fontWeight: '700',
   },
   monoText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    fontSize: T.fontSize.xs,
-  },
-  errorBox: {
-    backgroundColor: T.colors.errorBg,
-    borderRadius: T.radius.md,
-    padding: T.spacing.md,
-    borderWidth: 1,
-    borderColor: '#fecdd3',
-    marginBottom: T.spacing.lg,
-    width: '100%',
-  },
-  errorText: {
-    color: T.colors.error,
-    fontSize: T.fontSize.sm,
-    textAlign: 'center',
-    fontWeight: '500',
-  },
-  helpText: {
-    color: T.colors.textMuted,
-    fontSize: T.fontSize.xs,
-    textAlign: 'center',
-    marginBottom: T.spacing.lg,
   },
   primaryBtn: {
-    backgroundColor: T.colors.primary,
-    borderRadius: T.radius.md,
-    paddingVertical: T.spacing.md,
-    paddingHorizontal: T.spacing.xl,
     width: '100%',
+    backgroundColor: T.colors.primary,
+    paddingVertical: T.spacing.md,
+    borderRadius: T.radius.lg,
     alignItems: 'center',
+    marginTop: T.spacing.sm,
     ...T.shadow.sm,
   },
   primaryBtnText: {
@@ -382,22 +456,38 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   outlineBtn: {
-    marginTop: T.spacing.sm,
-    paddingVertical: T.spacing.md,
     width: '100%',
+    backgroundColor: 'transparent',
+    paddingVertical: T.spacing.md,
+    borderRadius: T.radius.lg,
     alignItems: 'center',
+    marginTop: T.spacing.sm,
+    borderWidth: 1,
+    borderColor: T.colors.border,
   },
   outlineBtnText: {
     color: T.colors.textSecondary,
     fontSize: T.fontSize.base,
     fontWeight: '600',
   },
-  cancelLink: {
-    padding: T.spacing.sm,
+  errorBox: {
+    width: '100%',
+    backgroundColor: T.colors.errorBg,
+    borderRadius: T.radius.md,
+    padding: T.spacing.md,
+    marginBottom: T.spacing.md,
+    borderWidth: 1,
+    borderColor: '#fecdd3',
   },
-  cancelLinkText: {
+  errorText: {
     color: T.colors.error,
     fontSize: T.fontSize.sm,
-    fontWeight: '600',
+    textAlign: 'center',
+  },
+  helpText: {
+    fontSize: T.fontSize.xs,
+    color: T.colors.textMuted,
+    textAlign: 'center',
+    marginBottom: T.spacing.md,
   },
 });

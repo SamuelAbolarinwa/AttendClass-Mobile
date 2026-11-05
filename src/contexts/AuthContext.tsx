@@ -20,7 +20,8 @@ export interface Account {
   token: string;
   matric_number?: string;
   last_online_verified_at?: string;
-  offline_valid_until?: string; // ISO string, maximum 7 days offline lease
+  offline_valid_until?: string; // Optional metadata timestamp
+  device_security_level?: string;
 }
 
 export interface AuthState {
@@ -32,6 +33,8 @@ export interface AuthState {
   errorMessage: string | null;
   signIn: (identifier: string, password: string) => Promise<{ error: string | null }>;
   signOut: () => Promise<void>;
+  revokeDeviceCredential: () => Promise<{ error: string | null }>;
+  requestDeviceChange: (reason: string) => Promise<{ error: string | null }>;
   updateAccount: (updates: Partial<Account>) => void;
   forceSetPassword: (currentPass: string, newPass: string) => Promise<{ error: string | null }>;
   enrollDeviceWithCode: (activationCode: string, deviceName?: string) => Promise<{ error: string | null }>;
@@ -104,7 +107,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const hasDeviceKey = await AttendanceSigner.hasEnrolledDeviceKey(storedAccount.id);
         setIsDeviceEnrolled(hasDeviceKey);
 
-        // Attempt online validation with Supabase
+        // Always restore local account identity immediately for offline access
+        setAccount(storedAccount);
+        if (hasDeviceKey) {
+          setAuthStatus('OFFLINE_AUTHORISED');
+          setErrorMessage(null);
+        } else {
+          setAuthStatus('SIGNED_OUT');
+          setErrorMessage('Device enrolment required before offline attendance can be used.');
+        }
+
+        // Attempt online validation with Supabase in background
         try {
           const { data, error } = await supabase.rpc('platform_verify_session', {
             p_token: storedAccount.token,
@@ -123,73 +136,54 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               isNetworkError(error);
 
             if (isGatewayOrTransient) {
-              throw error; // Let outer network catch handle offline policy
+              DiagnosticLogger.info('AUTH', 'Offline startup; transient backend error', { error: error.message });
+            } else {
+              // Explicit backend session expired (e.g. 12hr lifetime)
+              // IMPORTANT: Offline attendance remains fully functional on registered device!
+              DiagnosticLogger.info('AUTH', 'Online session expired, offline attendance remains active');
+              if (hasDeviceKey) {
+                setAuthStatus('OFFLINE_AUTHORISED');
+              } else {
+                setAuthStatus('CREDENTIAL_EXPIRED_OR_REVOKED');
+                setErrorMessage('Your session has expired. Please sign in again.');
+              }
             }
-
-            // Explicit backend failure -> Revoked or invalid session
-            DiagnosticLogger.warn('AUTH', 'Session rejected by backend', { error: error.message });
-            setAccount(storedAccount);
-            setAuthStatus('CREDENTIAL_EXPIRED_OR_REVOKED');
-            setErrorMessage('Your session has expired. Please sign in again.');
             return;
           }
 
           const result = data as { valid?: boolean; account_id?: string } | null;
           if (result && result.valid) {
-            // Online session is valid! Renew offline lease
             const now = new Date();
             const updatedAccount: Account = {
               ...storedAccount,
               last_online_verified_at: now.toISOString(),
-              offline_valid_until: new Date(now.getTime() + OFFLINE_LEASE_DURATION_MS).toISOString(),
             };
 
             setAccount(updatedAccount);
             setAuthStatus('ONLINE_AUTHENTICATED');
             await saveAccount(updatedAccount);
-
-            // Check face enrollment status online
-            try {
-              const { data: enrData, error: enrError } = await supabase.rpc('platform_has_active_enrollment', {
-                p_token: storedAccount.token,
-                p_model_version: 'mobilefacenet-mobile-v1',
-              });
-              if (!enrError && (enrData as { has_active?: boolean })?.has_active) {
-                setHasMobileEnrollment(true);
-              }
-            } catch {
-              // Non-blocking face check failure
-            }
           } else {
-            // Explicitly invalid or revoked
-            DiagnosticLogger.warn('AUTH', 'Session token invalid or revoked');
-            setAccount(storedAccount);
-            setAuthStatus('CREDENTIAL_EXPIRED_OR_REVOKED');
-            setErrorMessage('Your session was revoked or expired. Please sign in.');
+            // Online token invalid or revoked, but registered phone can still check in offline
+            if (hasDeviceKey) {
+              setAuthStatus('OFFLINE_AUTHORISED');
+            } else {
+              setAccount(storedAccount);
+              setAuthStatus('CREDENTIAL_EXPIRED_OR_REVOKED');
+              setErrorMessage('Your session was revoked or expired. Please sign in.');
+            }
           }
         } catch (networkErr: unknown) {
           // Network failure: Evaluate Defined Offline Authorization Policy
           // CRITICAL: NEVER delete saved credentials merely because a request times out or the phone is offline!
-          DiagnosticLogger.info('AUTH', 'Network unreachable during startup, evaluating offline policy', {
+          DiagnosticLogger.info('AUTH', 'Network unreachable during startup; operating in offline mode', {
             error: networkErr instanceof Error ? networkErr.message : String(networkErr),
           });
 
-          const now = Date.now();
-          const validUntil = storedAccount.offline_valid_until ? new Date(storedAccount.offline_valid_until).getTime() : 0;
-          const isWithinLease = validUntil > now;
-
-          if (hasDeviceKey && isWithinLease) {
-            // Authorized offline access policy satisfied
+          if (hasDeviceKey) {
             setAccount(storedAccount);
             setAuthStatus('OFFLINE_AUTHORISED');
             setErrorMessage(null);
-          } else if (hasDeviceKey && !isWithinLease) {
-            // Offline lease expired
-            setAccount(storedAccount);
-            setAuthStatus('CREDENTIAL_EXPIRED_OR_REVOKED');
-            setErrorMessage('Offline access lease has expired. Please connect to internet to re-verify.');
           } else {
-            // Device key not enrolled yet
             setAccount(storedAccount);
             setAuthStatus('OFFLINE_AUTHORISED');
             setErrorMessage('Device enrolment required before offline attendance can be used.');
@@ -387,6 +381,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [account],
   );
 
+  const revokeDeviceCredential = useCallback(async (): Promise<{ error: string | null }> => {
+    if (!account?.id) return { error: 'No active account' };
+    try {
+      await AttendanceSigner.clearDeviceKey(account.id);
+      setIsDeviceEnrolled(false);
+      DiagnosticLogger.info('AUTH', 'Device signing key revoked locally', { accountId: account.id });
+      return { error: null };
+    } catch (e: unknown) {
+      return { error: e instanceof Error ? e.message : 'Error revoking device key' };
+    }
+  }, [account?.id]);
+
+  const requestDeviceChange = useCallback(
+    async (reason: string): Promise<{ error: string | null }> => {
+      if (!account?.token) return { error: 'Online sign-in required to request device change' };
+      try {
+        const { data, error } = await supabase.rpc('platform_request_device_change', {
+          p_token: account.token,
+          p_reason: reason.trim(),
+        });
+        if (error) return { error: error.message };
+        const res = data as { ok?: boolean; error?: string } | null;
+        if (!res?.ok) return { error: res?.error || 'Failed to submit device change request' };
+        return { error: null };
+      } catch (e: unknown) {
+        return { error: e instanceof Error ? e.message : 'Network error submitting request' };
+      }
+    },
+    [account?.token],
+  );
+
   return (
     <AuthContext.Provider
       value={{
@@ -398,6 +423,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         errorMessage,
         signIn,
         signOut,
+        revokeDeviceCredential,
+        requestDeviceChange,
         updateAccount,
         forceSetPassword,
         enrollDeviceWithCode,

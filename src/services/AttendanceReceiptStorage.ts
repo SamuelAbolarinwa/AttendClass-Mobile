@@ -91,6 +91,10 @@ export class AttendanceReceiptStorage {
     }
   }
 
+  public static async getAllReceipts(accountId: string): Promise<AttendanceReceipt[]> {
+    return this.getReceipts(accountId);
+  }
+
   /**
    * Save a new device-confirmed receipt idempotently.
    */

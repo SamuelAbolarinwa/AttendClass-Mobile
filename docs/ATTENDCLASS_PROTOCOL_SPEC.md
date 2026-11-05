@@ -26,18 +26,49 @@ AttendClass enables students to record verifiable attendance at physical ESP32 t
 
 ---
 
-## 2. Bluetooth GATT Architecture
+## 2. Classroom QR Specification & Bluetooth GATT Architecture
 
-### 2.1 UUID Definitions
-All BLE communications take place over the AttendClass custom 128-bit GATT Service:
+### 2.1 Permanent Classroom QR Specification
+Each physical ESP32 attendance terminal has a permanent QR code placed on the device casing or classroom wall. It is strictly static and does not rotate.
 
+**JSON Payload**:
+```json
+{
+  "v": 1,
+  "type": "attendclass_device",
+  "device_id": "ESP32_CS_LAB1",
+  "service_uuid": "4e67a100-1234-5678-abcd-0123456789ab",
+  "device_key_fingerprint": "sha256:d41d8cd98f00b204e9800998ecf8427e..."
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `v` | `number` | Version number (must be `1`). |
+| `type` | `string` | Literal identifier (must be `"attendclass_device"`). |
+| `device_id` | `string` | Unique physical identifier matching BLE peripheral name. |
+| `service_uuid` | `string` | Target BLE Service UUID for direct connection. |
+| `device_key_fingerprint` | `string` | Optional SHA-256 fingerprint of the terminal's public key (`sha256:<hex>`). |
+
+---
+
+### 2.2 Bluetooth GATT Architecture & Dual Service Resolution
+To support both original and extended firmware profiles, AttendClass automatically discovers and resolves either of the following GATT profiles:
+
+#### Profile A: Primary AttendClass Firmware Profile
+| Name | UUID | Type | Properties | Description |
+|---|---|---|---|---|
+| **Primary Attendance Service** | `4e67a100-1234-5678-abcd-0123456789ab` | Service | N/A | Base attendance service |
+| **Write Characteristic** | `4e67a101-1234-5678-abcd-0123456789ab` | Characteristic | Write, Write Without Response | Client sends `HELLO`, `PROOF`, `GET_RESULT` |
+| **Notify Characteristic** | `4e67a102-1234-5678-abcd-0123456789ab` | Characteristic | Notify, Indicate, Read | Terminal streams `CHALLENGE`, `RESULT` |
+
+#### Profile B: Secondary / Legacy Characteristic Mapping
 | Name | UUID | Type | Properties | Description |
 |---|---|---|---|---|
 | **Primary Attendance Service** | `0000ff10-0000-1000-8000-00805f9b34fb` | Service | N/A | Base offline attendance service |
 | **Challenge Characteristic** | `0000ff11-0000-1000-8000-00805f9b34fb` | Characteristic | Read, Notify | Terminal issues time-bound cryptographic challenge |
 | **Submission Characteristic** | `0000ff12-0000-1000-8000-00805f9b34fb` | Characteristic | Write, Write Without Response | Phone transmits signed attendance or reconciliation query |
 | **Acknowledgement / Receipt** | `0000ff13-0000-1000-8000-00805f9b34fb` | Characteristic | Read, Notify | Terminal issues durable signed receipt |
-| **Legacy Time Sync (v2)** | `0000ff01-0000-1000-8000-00805f9b34fb` | Characteristic | Write | Phone-to-terminal provisional clock sync |
 
 ---
 
@@ -86,94 +117,128 @@ All packets transmitted over Characteristics `0000ff11`, `0000ff12`, and `0000ff
 
 ---
 
-### 4.2 Terminal Challenge Message
-Issued by ESP32 over Characteristic `0000ff11`.
+### 4.2 AttendClass BLE Protocol v1 Lifecycle
 
-**Payload (JSON)**:
+The attendance verification protocol executes in sequential steps:
+
+```
+Mobile App (Student)                               ESP32 Terminal
+     │                                                    │
+     │ 1. HELLO (request_id, student_id, matric)          │
+     ├───────────────────────────────────────────────────>│
+     │                                                    │
+     │ 2. CHALLENGE (nonce, terminal_time, course, sig)   │
+     │<───────────────────────────────────────────────────┤
+     │                                                    │
+     │ [App verifies terminal sig & prompts fingerprint]  │
+     │                                                    │
+     │ 3. PROOF (challenge, student_id, sig, pub_key)     │
+     ├───────────────────────────────────────────────────>│
+     │                                                    │
+     │ [Terminal verifies student sig & persists to SD]   │
+     │                                                    │
+     │ 4. RESULT (status: SUCCESS, saved_at, receipt_sig) │
+     │<───────────────────────────────────────────────────┤
+     │                                                    │
+     │ [Optional disconnect recovery]                     │
+     │ 5. GET_RESULT (request_id, credential_id)          │
+     ├───────────────────────────────────────────────────>│
+     │ 6. RESULT (status: SUCCESS/ALREADY_RECORDED)       │
+     │<───────────────────────────────────────────────────┤
+```
+
+---
+
+### 4.3 Protocol v1 Messages
+
+#### A. HELLO Message (Step 1 - Mobile to ESP32)
 ```json
 {
-  "version": 1,
-  "terminal_id": "TERM-LAB1-01",
-  "session_id": "sess_20261006",
-  "challenge": "<32-byte Base64 TRNG nonce>",
-  "terminal_time": 1791298800,
-  "time_confidence": "rtc" | "unsynchronized" | "estimated",
+  "v": 1,
+  "type": "HELLO",
+  "request_id": "req-9b8c2d1e-4f3a-4a11-b2c3-1a2b3c4d5e6f",
+  "student_id": "std-uuid-001",
+  "matric_number": "2021/1/12345CP",
+  "credential_id": "cred-p256-01"
+}
+```
+
+#### B. CHALLENGE Message (Step 2 - ESP32 to Mobile)
+```json
+{
+  "v": 1,
+  "type": "CHALLENGE",
+  "request_id": "req-9b8c2d1e-4f3a-4a11-b2c3-1a2b3c4d5e6f",
+  "terminal_id": "ESP32_CS_LAB1",
+  "session_id": "sess_20261105_01",
+  "challenge": "<32-byte Base64 nonce>",
+  "terminal_time": 1793917200,
   "course_code": "CSC401",
   "signature": "<Terminal ECDSA P-256 Signature Base64>"
 }
 ```
 
-**Canonical String for Challenge Signing**:
+**Canonical Challenge Signing Format (`ATTENDCLASS_CHALLENGE_V1`)**:
 ```
-v1|challenge|{terminal_id}|{session_id}|{challenge}|{terminal_time}|{time_confidence}|{course_code}
+ATTENDCLASS_CHALLENGE_V1|{terminal_id}|{session_id}|{challenge}|{terminal_time}|{course_code}
 ```
+*(Legacy fallback canonical string: `v1|challenge|{terminal_id}|{session_id}|{challenge}|{terminal_time}|{time_confidence}|{course_code}`)*
 
-**Security Rules**:
-- Challenge nonces are single-use and expire 60,000 ms (60s) after generation using monotonic elapsed time (`millis()`).
-- Signed using the provisioned terminal private key.
-- Verified by the mobile app against the institutional `TerminalTrustStore`.
-
----
-
-### 4.3 Attendance Submission Message
-Transmitted by Mobile App over Characteristic `0000ff12`.
-
-**Payload (JSON)**:
+#### C. PROOF Message (Step 3 - Mobile to ESP32)
 ```json
 {
-  "version": 1,
-  "event_id": "c1f7b0a8-4e3d-4c8e-9d8a-6b2f4e8a1d2c",
+  "v": 1,
+  "type": "PROOF",
+  "request_id": "req-9b8c2d1e-4f3a-4a11-b2c3-1a2b3c4d5e6f",
   "credential_id": "cred-p256-01",
-  "credential_version": "v1",
-  "algorithm": "ECDSA_P256_SHA256",
   "student_id": "std-uuid-001",
   "matric_number": "2021/1/12345CP",
-  "terminal_id": "TERM-LAB1-01",
-  "session_id": "sess_20261006",
+  "terminal_id": "ESP32_CS_LAB1",
+  "session_id": "sess_20261105_01",
   "challenge": "<32-byte Base64 nonce>",
-  "timestamp": 1791298800,
-  "timestamp_source": "phone_os",
+  "timestamp": 1793917205,
   "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...",
-  "signature": "<Student ECDSA P-256 Signature Base64>"
+  "signature": "<Student Biometric-Gated ECDSA P-256 Signature Base64>"
 }
 ```
 
-**Canonical String for Submission Signing**:
+**Canonical Proof Signing Format (`ATTENDCLASS_CHECKIN_V1`)**:
 ```
-v1|submission|{event_id}|{credential_id}|{credential_version}|{algorithm}|{student_id}|{matric_number}|{terminal_id}|{session_id}|{challenge}|{timestamp}|{timestamp_source}
+ATTENDCLASS_CHECKIN_V1|{credential_id}|{student_id}|{terminal_id}|{session_id}|{challenge}|{timestamp}
 ```
+*(Legacy fallback canonical string: `v1|submission|{event_id}|{credential_id}|{credential_version}|{algorithm}|{student_id}|{matric_number}|{terminal_id}|{session_id}|{challenge}|{timestamp}|{timestamp_source}`)*
 
-**Security Rules**:
-- Terminal validates `terminal_id` matches its own identity.
-- Terminal validates `challenge` matches an active unexpired challenge nonce.
-- Terminal looks up student in cached `/enrolled_keys.csv` and verifies `public_key` matches the authorized public key.
-- Terminal verifies the ECDSA signature via mbedtls before recording attendance.
-
----
-
-### 4.4 Terminal Acknowledgement / Receipt Message
-Issued by ESP32 over Characteristic `0000ff13` ONLY after successful SD write and flush.
-
-**Payload (JSON)**:
+#### D. RESULT Message (Step 4 - ESP32 to Mobile)
 ```json
 {
-  "version": 1,
-  "event_id": "c1f7b0a8-4e3d-4c8e-9d8a-6b2f4e8a1d2c",
-  "terminal_id": "TERM-LAB1-01",
-  "session_id": "sess_20261006",
-  "submission_digest": "<SHA-256 Hex of Canonical Submission>",
-  "status": "DURABLY_SAVED",
-  "sd_persisted": true,
-  "record_index": 142,
-  "saved_at": "2026-10-08T09:30:00Z",
+  "v": 1,
+  "type": "RESULT",
+  "request_id": "req-9b8c2d1e-4f3a-4a11-b2c3-1a2b3c4d5e6f",
+  "status": "SUCCESS",
+  "terminal_id": "ESP32_CS_LAB1",
+  "session_id": "sess_20261105_01",
+  "saved_at": 1793917206,
+  "record_index": 42,
   "signature": "<Terminal ECDSA P-256 Signature Base64>",
-  "error_code": null
+  "error_code": null,
+  "message": "Attendance verified and durably recorded."
 }
 ```
 
-**Canonical String for Receipt Signing**:
+**Canonical Receipt Signing Format (`ATTENDCLASS_RECEIPT_V1`)**:
 ```
-v1|receipt|{event_id}|{terminal_id}|{session_id}|{submission_digest}|{status}|{sd_persisted}|{record_index}|{saved_at}
+ATTENDCLASS_RECEIPT_V1|{request_id}|{terminal_id}|{session_id}|{status}|{saved_at}
+```
+*(Legacy fallback canonical string: `v1|receipt|{event_id}|{terminal_id}|{session_id}|{submission_digest}|{status}|{sd_persisted}|{record_index}|{saved_at}`)*
+
+#### E. GET_RESULT Message (Step 5 - Recovery Query)
+```json
+{
+  "v": 1,
+  "type": "GET_RESULT",
+  "request_id": "req-9b8c2d1e-4f3a-4a11-b2c3-1a2b3c4d5e6f",
+  "credential_id": "cred-p256-01"
+}
 ```
 
 **Persistence Semantics**:
@@ -235,3 +300,57 @@ event_id,student_id,matric_number,terminal_id,session_id,phone_timestamp,termina
   * The terminal receipt signature over `terminal_saved_at` and `submission_digest` is cryptographically verified against the terminal's registered public key in `devices`.
   * If the receipt signature is missing or invalid, the record is permanently rejected with `DEVICE_REVOKED_PRIOR_TO_SYNC`.
   * If verified, `terminal_saved_at` is compared against `revoked_at`. If `terminal_saved_at < revoked_at`, the record is `ACCEPTED`; otherwise, `REJECTED`.
+
+---
+
+## 7. Mobile Attendance State Machine (17 States)
+
+The AttendClass mobile application enforces a deterministic 17-state machine:
+
+```
+[ READY ] ──> [ SCANNING_QR ] ──> [ QR_VALIDATED ]
+                                         │
+                                         ▼
+[ WAITING_FOR_CHALLENGE ] <── [ VERIFYING_ESP ] <── [ CONNECTING_BLE ] <── [ SEARCHING_DEVICE ]
+          │
+          ▼
+[ WAITING_FOR_BIOMETRIC ] ──> [ SIGNING_CHALLENGE ] ──> [ SENDING_PROOF ]
+                                                              │
+                                                              ▼
+[ SUCCESS / ALREADY_RECORDED ] <── [ VERIFYING_RECEIPT ] <── [ WAITING_FOR_RESULT ]
+                                                              │ (disconnect timeout)
+                                                              ▼
+                                                     [ RECOVERING_RESULT ]
+```
+
+| State | Description | Next Permitted States |
+|---|---|---|
+| `READY` | Default initial state; ready to start check-in | `SCANNING_QR`, `SEARCHING_DEVICE`, `FAILED` |
+| `SCANNING_QR` | VisionCamera viewfinder active scanning classroom QR | `QR_VALIDATED`, `CANCELLED`, `FAILED` |
+| `QR_VALIDATED` | QR payload parsed and terminal trust verified | `SEARCHING_DEVICE`, `CONNECTING_BLE`, `FAILED` |
+| `SEARCHING_DEVICE` | BLE scanning for terminal advertisement | `CONNECTING_BLE`, `CANCELLED`, `FAILED` |
+| `CONNECTING_BLE` | GATT connection and MTU negotiation | `VERIFYING_ESP`, `CANCELLED`, `FAILED` |
+| `VERIFYING_ESP` | Terminal GATT service discovery | `WAITING_FOR_CHALLENGE`, `CANCELLED`, `FAILED` |
+| `WAITING_FOR_CHALLENGE` | Sent `HELLO`, awaiting terminal `CHALLENGE` | `WAITING_FOR_BIOMETRIC`, `CANCELLED`, `FAILED` |
+| `WAITING_FOR_BIOMETRIC` | Native BiometricPrompt active | `SIGNING_CHALLENGE`, `CANCELLED`, `FAILED` |
+| `SIGNING_CHALLENGE` | Hardware-backed Android Keystore ECDSA signing | `SENDING_PROOF`, `FAILED` |
+| `SENDING_PROOF` | Framed binary transmission of `PROOF` over BLE | `WAITING_FOR_RESULT`, `FAILED` |
+| `WAITING_FOR_RESULT` | Awaiting terminal `RESULT` acknowledgement | `VERIFYING_RECEIPT`, `RECOVERING_RESULT`, `FAILED` |
+| `VERIFYING_RECEIPT` | Verifying terminal ECDSA receipt signature | `SUCCESS`, `ALREADY_RECORDED`, `FAILED` |
+| `RECOVERING_RESULT` | Connection interrupted; sending `GET_RESULT` query | `VERIFYING_RECEIPT`, `FAILED` |
+| `SUCCESS` | Attendance durably saved and receipt verified | `READY` |
+| `ALREADY_RECORDED` | Student already marked for this session | `READY` |
+| `FAILED` | Unrecoverable error occurred; error banner displayed | `READY` |
+| `CANCELLED` | Aborted by user | `READY` |
+
+---
+
+## 8. Administrative BLE Sync & Bridging
+
+In environments where ESP32 terminals lack active Wi-Fi or internet backhaul:
+1. An authorised administrator or course representative logs into AttendClass Mobile with administrative privileges.
+2. The phone connects to the ESP32 terminal over BLE.
+3. The phone requests pending offline attendance records via batch queries.
+4. The phone proxies the signed records securely to the Supabase `hardware-sync` Edge Function.
+5. Upon receiving authenticated `ACCEPTED` / `DUPLICATE` confirmations from Supabase, the phone transmits the sync checkpoint back to the ESP32, which advances its `sync_checkpoint.txt` pointer on SD.
+6. The terminal remains completely secure: all records retain student and terminal cryptographic signatures that Supabase verifies end-to-end.

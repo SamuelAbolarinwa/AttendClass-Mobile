@@ -3,11 +3,14 @@
  */
 
 import React from 'react';
-import ReactTestRenderer from 'react-test-renderer';
+import ReactTestRenderer, { act } from 'react-test-renderer';
 import App from '../App';
 
 test('renders correctly', async () => {
-  await ReactTestRenderer.act(() => {
-    ReactTestRenderer.create(<App />);
+  let root: any;
+  await act(async () => {
+    root = ReactTestRenderer.create(<App />);
+    await new Promise((resolve) => setTimeout(() => resolve(undefined), 50));
   });
+  expect(root).toBeDefined();
 });

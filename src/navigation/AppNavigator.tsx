@@ -10,6 +10,7 @@ import SettingsScreen from '../screens/SettingsScreen';
 
 import EnrollFaceScreen from '../screens/EnrollFaceScreen';
 import CheckInScreen from '../screens/CheckInScreen';
+import QRScannerScreen from '../screens/QRScannerScreen';
 
 const Stack = createNativeStackNavigator();
 
@@ -34,6 +35,7 @@ export default function AppNavigator() {
         <Stack.Group>
           <Stack.Screen name="Dashboard" component={DashboardScreen} />
           <Stack.Screen name="Settings" component={SettingsScreen} />
+          <Stack.Screen name="QRScanner" component={QRScannerScreen} />
           <Stack.Screen name="CheckIn" component={CheckInScreen} />
           <Stack.Screen name="EnrollFace" component={EnrollFaceScreen} />
         </Stack.Group>

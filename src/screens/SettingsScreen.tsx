@@ -17,7 +17,15 @@ import { DiagnosticLogger } from '../services/DiagnosticLogger';
 import { T } from '../theme/tokens';
 
 export default function SettingsScreen({ navigation }: any) {
-  const { account, authStatus, isDeviceEnrolled, enrollDeviceWithCode, signOut } = useAuth();
+  const {
+    account,
+    authStatus,
+    isDeviceEnrolled,
+    enrollDeviceWithCode,
+    revokeDeviceCredential,
+    requestDeviceChange,
+    signOut,
+  } = useAuth();
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -31,6 +39,12 @@ export default function SettingsScreen({ navigation }: any) {
   const [enrollingDevice, setEnrollingDevice] = useState(false);
   const [enrollError, setEnrollError] = useState<string | null>(null);
   const [enrollSuccess, setEnrollSuccess] = useState(false);
+
+  // Device change request state
+  const [showChangeRequest, setShowChangeRequest] = useState(false);
+  const [changeReason, setChangeReason] = useState('');
+  const [submittingChange, setSubmittingChange] = useState(false);
+  const [changeFeedback, setChangeFeedback] = useState<string | null>(null);
 
   // Diagnostics view
   const [showLogs, setShowLogs] = useState(false);
@@ -53,7 +67,49 @@ export default function SettingsScreen({ navigation }: any) {
     } else {
       setEnrollSuccess(true);
       setActivationCode('');
-      Alert.alert('Device Authorised', 'Your phone has been bound to your account and is authorised for attendance.');
+      Alert.alert(
+        'Device Authorised',
+        'Your phone has been bound to your account with a non-exportable hardware key and is authorised for attendance.',
+      );
+    }
+  };
+
+  const handleRevokeCredential = () => {
+    Alert.alert(
+      'Revoke Device Credential',
+      'This will remove your authorised attendance key from this phone. You will not be able to mark attendance until you enrol again with an administrator activation code. Continue?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Revoke Key',
+          style: 'destructive',
+          onPress: async () => {
+            const res = await revokeDeviceCredential();
+            if (res.error) {
+              Alert.alert('Error', res.error);
+            } else {
+              Alert.alert('Credential Revoked', 'Attendance signing key was removed.');
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const handleSubmitChangeRequest = async () => {
+    if (!changeReason.trim()) {
+      Alert.alert('Reason Required', 'Please provide a reason for replacing your registered phone.');
+      return;
+    }
+    setSubmittingChange(true);
+    setChangeFeedback(null);
+    const res = await requestDeviceChange(changeReason.trim());
+    setSubmittingChange(false);
+    if (res.error) {
+      setChangeFeedback(`⚠️ ${res.error}`);
+    } else {
+      setChangeFeedback('✓ Device change request submitted. Your course administrator will review it.');
+      setChangeReason('');
     }
   };
 
@@ -199,6 +255,57 @@ export default function SettingsScreen({ navigation }: any) {
               </Text>
             )}
           </TouchableOpacity>
+
+          {isDeviceEnrolled && (
+            <TouchableOpacity
+              style={styles.revokeLink}
+              onPress={handleRevokeCredential}
+            >
+              <Text style={styles.revokeLinkText}>Revoke Attendance Credential</Text>
+            </TouchableOpacity>
+          )}
+
+          {/* Device Change Request Workflow */}
+          <View style={styles.changeRequestDivider} />
+          <TouchableOpacity
+            style={styles.changeRequestToggle}
+            onPress={() => setShowChangeRequest((prev) => !prev)}
+          >
+            <Text style={styles.changeRequestToggleText}>
+              {showChangeRequest ? '▲ Hide Device Change Request' : '▼ Request Device Change (Lost/New Phone)'}
+            </Text>
+          </TouchableOpacity>
+
+          {showChangeRequest && (
+            <View style={styles.changeRequestBox}>
+              <Text style={styles.changeRequestInfo}>
+                Under the one-phone-per-student security policy, registering a replacement phone requires approval from your course representative or lecturer.
+              </Text>
+              {changeFeedback ? (
+                <Text style={styles.changeFeedbackText}>{changeFeedback}</Text>
+              ) : null}
+              <TextInput
+                style={styles.changeInput}
+                placeholder="Explain why you need to replace your phone (e.g. upgraded device, lost previous phone)..."
+                placeholderTextColor={T.colors.inputPlaceholder}
+                value={changeReason}
+                onChangeText={setChangeReason}
+                multiline
+                numberOfLines={3}
+              />
+              <TouchableOpacity
+                style={[styles.outlineBtn, submittingChange && styles.disabledBtn]}
+                onPress={handleSubmitChangeRequest}
+                disabled={submittingChange}
+              >
+                {submittingChange ? (
+                  <ActivityIndicator color={T.colors.primary} size="small" />
+                ) : (
+                  <Text style={styles.outlineBtnText}>Submit Replacement Request</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          )}
         </View>
 
         {/* Change Password */}
@@ -505,6 +612,60 @@ const styles = StyleSheet.create({
   logMsg: {
     fontSize: 11,
     color: T.colors.text,
+  },
+  revokeLink: {
+    alignSelf: 'center',
+    paddingVertical: T.spacing.sm,
+    marginTop: T.spacing.xs,
+  },
+  revokeLinkText: {
+    color: '#dc2626',
+    fontSize: T.fontSize.xs,
+    fontWeight: '600',
+  },
+  changeRequestDivider: {
+    height: 1,
+    backgroundColor: T.colors.border,
+    marginVertical: T.spacing.md,
+  },
+  changeRequestToggle: {
+    paddingVertical: T.spacing.xs,
+    alignItems: 'center',
+  },
+  changeRequestToggleText: {
+    color: T.colors.primary,
+    fontSize: T.fontSize.xs,
+    fontWeight: '700',
+  },
+  changeRequestBox: {
+    marginTop: T.spacing.sm,
+    padding: T.spacing.md,
+    backgroundColor: T.colors.bg,
+    borderRadius: T.radius.md,
+  },
+  changeRequestInfo: {
+    fontSize: T.fontSize.xs,
+    color: T.colors.textSecondary,
+    marginBottom: T.spacing.sm,
+    lineHeight: 16,
+  },
+  changeFeedbackText: {
+    fontSize: T.fontSize.xs,
+    fontWeight: '700',
+    color: T.colors.primary,
+    marginBottom: T.spacing.xs,
+  },
+  changeInput: {
+    backgroundColor: T.colors.surface,
+    borderWidth: 1,
+    borderColor: T.colors.border,
+    borderRadius: T.radius.md,
+    padding: T.spacing.sm,
+    fontSize: T.fontSize.xs,
+    color: T.colors.text,
+    textAlignVertical: 'top',
+    marginBottom: T.spacing.sm,
+    minHeight: 60,
   },
   logoutBtn: {
     backgroundColor: '#fee2e2',

@@ -264,6 +264,14 @@ export class DeviceSecurityService {
 
         if (!isStaging) {
           await this.setActiveCredentialId(accountId, credentialId);
+          try {
+            await Keychain.setGenericPassword('pubkey', result.publicKeyDerBase64, {
+              service: `attendclass_pubkey_${accountId}`,
+              accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+            });
+          } catch {
+            // non-fatal
+          }
         }
 
         return {
@@ -524,10 +532,31 @@ export class DeviceSecurityService {
   public static async getActivePublicKey(accountId: string): Promise<string | null> {
     const credId = await this.getActiveCredentialId(accountId);
     const alias = credId ? this.getCredentialAlias(credId) : this.getActiveAlias(accountId);
+
+    if (this.isNativeAndroidKeyStoreAvailable()) {
+      try {
+        const pubKey = await NativeModules.AndroidKeyStore.getPublicKey(alias);
+        if (pubKey) return pubKey;
+      } catch {
+        // Fall back to cache or simulation
+      }
+    }
+
     if (simulatedKeyStore.has(alias)) {
       return simulatedKeyStore.get(alias)!.publicKeyDerBase64;
     }
-    // If native, key exists in Keystore
+
+    try {
+      const res = await Keychain.getGenericPassword({
+        service: `attendclass_pubkey_${accountId}`,
+      });
+      if (res && res.password) {
+        return res.password;
+      }
+    } catch {
+      // ignore
+    }
+
     return null;
   }
 

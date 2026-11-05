@@ -106,17 +106,48 @@ jest.mock('react-native-ble-plx', () => {
 // Mock react-native-safe-area-context
 jest.mock('react-native-safe-area-context', () => {
   const React = require('react');
+  const insetsContext = React.createContext({ top: 0, bottom: 0, left: 0, right: 0 });
+  const frameContext = React.createContext({ x: 0, y: 0, width: 375, height: 812 });
   return {
     SafeAreaProvider: ({ children }) => children,
     SafeAreaView: ({ children, style }) => React.createElement('View', { style }, children),
+    SafeAreaInsetsContext: insetsContext,
+    SafeAreaFrameContext: frameContext,
     useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+    useSafeAreaFrame: () => ({ x: 0, y: 0, width: 375, height: 812 }),
   };
 });
 
 // Mock react-native-screens
-jest.mock('react-native-screens', () => ({
-  enableScreens: jest.fn(),
-}));
+jest.mock('react-native-screens', () => {
+  const React = require('react');
+  const { View } = require('react-native');
+  return {
+    enableScreens: jest.fn(),
+    enableFreeze: jest.fn(),
+    screensEnabled: jest.fn(() => true),
+    freezeEnabled: jest.fn(() => false),
+    compatibilityFlags: {},
+    featureFlags: {},
+    Screen: View,
+    InnerScreen: View,
+    ScreenContext: React.createContext(null),
+    ScreenStackHeaderConfig: View,
+    ScreenStackHeaderSubview: View,
+    ScreenStackHeaderLeftView: View,
+    ScreenStackHeaderCenterView: View,
+    ScreenStackHeaderRightView: View,
+    ScreenStackHeaderBackButtonImage: View,
+    ScreenStackHeaderSearchBarView: View,
+    SearchBar: View,
+    ScreenContainer: View,
+    ScreenStack: View,
+    ScreenStackItem: View,
+    FullWindowOverlay: View,
+    ScreenFooter: View,
+    ScreenContentWrapper: View,
+  };
+});
 
 // Mock react-native-reanimated
 jest.mock('react-native-reanimated', () => {

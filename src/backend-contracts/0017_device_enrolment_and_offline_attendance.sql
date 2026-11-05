@@ -372,3 +372,78 @@ BEGIN
   );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ── 9. Device Replacement Request Workflow ─────────────────────────────────
+CREATE TABLE IF NOT EXISTS device_change_requests (
+  id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id    uuid        NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  reason        text        NOT NULL,
+  status        text        NOT NULL DEFAULT 'pending', -- pending, approved, rejected
+  reviewed_by   uuid        REFERENCES profiles(id),
+  reviewed_at   timestamptz,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_change_requests_student ON device_change_requests(student_id, status);
+ALTER TABLE device_change_requests ENABLE ROW LEVEL SECURITY;
+CREATE POLICY device_change_requests_all ON device_change_requests FOR ALL USING (true) WITH CHECK (true);
+
+-- Student RPC: Submit Device Change Request
+CREATE OR REPLACE FUNCTION platform_request_device_change(
+  p_token uuid,
+  p_reason text
+)
+RETURNS jsonb AS $$
+DECLARE
+  _sess active_sessions%ROWTYPE;
+BEGIN
+  SELECT * INTO _sess FROM active_sessions WHERE token = p_token AND expires_at > now();
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Unauthorized: invalid or expired session');
+  END IF;
+
+  IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Please provide a clear reason for device replacement');
+  END IF;
+
+  INSERT INTO device_change_requests (student_id, reason, status)
+  VALUES (_sess.account_id, trim(p_reason), 'pending');
+
+  RETURN jsonb_build_object('ok', true, 'message', 'Device change request submitted');
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ── 10. Admin RPC: Get Enrolled Keys for ESP32 Provisioning (CSV) ─────────
+CREATE OR REPLACE FUNCTION platform_get_enrolled_keys_csv(
+  p_admin_token uuid
+)
+RETURNS text AS $$
+DECLARE
+  _sess active_sessions%ROWTYPE;
+  _admin profiles%ROWTYPE;
+  _csv text := 'student_id,matric_number,public_key,credential_id' || E'\n';
+  _row record;
+BEGIN
+  SELECT * INTO _sess FROM active_sessions WHERE token = p_admin_token AND expires_at > now();
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Unauthorized';
+  END IF;
+
+  SELECT * INTO _admin FROM profiles WHERE id = _sess.account_id;
+  IF _admin.role NOT IN ('administrator', 'manager') THEN
+    RAISE EXCEPTION 'Permission denied';
+  END IF;
+
+  FOR _row IN
+    SELECT sd.student_id, p.matric_number, sd.device_public_key, sd.credential_id
+    FROM student_devices sd
+    JOIN profiles p ON p.id = sd.student_id
+    WHERE sd.revoked_at IS NULL
+    ORDER BY sd.enrolled_at ASC
+  LOOP
+    _csv := _csv || _row.student_id || ',' || COALESCE(_row.matric_number, '') || ',' || _row.device_public_key || ',' || COALESCE(_row.credential_id, '') || E'\n';
+  END LOOP;
+
+  RETURN _csv;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;

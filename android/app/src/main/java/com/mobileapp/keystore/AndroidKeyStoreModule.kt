@@ -131,7 +131,7 @@ class AndroidKeyStoreModule(private val reactContext: ReactApplicationContext) :
             }
 
             // User authentication required: trigger BiometricPrompt on main thread
-            val activity = currentActivity as? FragmentActivity
+            val activity = reactContext.currentActivity as? FragmentActivity
             if (activity == null) {
                 promise.reject("NO_ACTIVITY", "Current activity is not available for BiometricPrompt")
                 return

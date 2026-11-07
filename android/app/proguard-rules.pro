@@ -37,3 +37,7 @@
 -keepclassmembers class * {
     @com.facebook.proguard.annotations.DoNotStrip *;
 }
+
+# Keep ML Kit Barcode Scanning & Custom BarcodeScanner Module
+-keep class com.google.mlkit.vision.barcode.** { *; }
+-keep class com.mobileapp.barcodescanner.** { *; }

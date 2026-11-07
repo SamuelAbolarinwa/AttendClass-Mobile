@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -7,18 +7,22 @@ import {
   ActivityIndicator,
   StatusBar,
   Dimensions,
+  Modal,
+  TextInput,
+  NativeModules,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   Camera,
   useCameraDevice,
   useCameraPermission,
-  useObjectOutput,
+  usePhotoOutput,
 } from 'react-native-vision-camera';
 import { useIsFocused } from '@react-navigation/native';
 import { QRValidator } from '../qr/QRValidator';
 import { T } from '../theme/tokens';
 
+const { BarcodeScanner } = NativeModules;
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const VIEWFINDER_SIZE = Math.min(SCREEN_WIDTH * 0.72, 280);
 
@@ -30,7 +34,12 @@ export default function QRScannerScreen({ navigation }: any) {
   const [torch, setTorch] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [manualModalVisible, setManualModalVisible] = useState(false);
+  const [manualInputText, setManualInputText] = useState('');
+
+  const photoOutput = usePhotoOutput({ qualityPrioritization: 'speed' });
   const lastScannedTimeRef = useRef(0);
+  const isScanningRef = useRef(false);
 
   const handleScannedText = useCallback(
     (rawText: string) => {
@@ -56,24 +65,56 @@ export default function QRScannerScreen({ navigation }: any) {
     [isProcessing, navigation],
   );
 
-  const objectOutput = useObjectOutput({
-    types: ['qr'],
-    onObjectsScanned: (objects: any[]) => {
-      if (isProcessing) return;
-      for (const obj of objects) {
-        if (obj.type === 'qr' && obj.value) {
-          handleScannedText(obj.value);
-          break;
+  // Background frame scan loop using photoOutput and ML Kit BarcodeScanner
+  useEffect(() => {
+    if (!isFocused || isProcessing || !hasPermission || !device) return;
+
+    let isMounted = true;
+    const interval = setInterval(async () => {
+      if (isScanningRef.current || isProcessing) return;
+      isScanningRef.current = true;
+
+      try {
+        if (!photoOutput) return;
+        const photo = await photoOutput.capturePhoto({}, {});
+        if (!isMounted) {
+          photo.dispose();
+          return;
         }
+
+        const photoPath = await photo.saveToTemporaryFileAsync();
+        photo.dispose();
+
+        if (BarcodeScanner && BarcodeScanner.scanFromUri) {
+          const barcodes: string[] = await BarcodeScanner.scanFromUri('file://' + photoPath);
+          if (isMounted && barcodes && barcodes.length > 0) {
+            handleScannedText(barcodes[0]);
+          }
+        }
+      } catch {
+        // Non-fatal: individual frame capture drop, continue next interval
+      } finally {
+        isScanningRef.current = false;
       }
-    },
-  });
+    }, 450);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [isFocused, isProcessing, hasPermission, device, photoOutput, handleScannedText]);
 
   const handleRequestPermission = async () => {
     const granted = await requestPermission();
     if (!granted) {
       setErrorBanner('Camera permission is required to scan classroom QR codes.');
     }
+  };
+
+  const handleManualSubmit = () => {
+    if (!manualInputText.trim()) return;
+    setManualModalVisible(false);
+    handleScannedText(manualInputText.trim());
   };
 
   if (!hasPermission) {
@@ -97,7 +138,15 @@ export default function QRScannerScreen({ navigation }: any) {
           <TouchableOpacity style={styles.primaryBtn} onPress={handleRequestPermission}>
             <Text style={styles.primaryBtnText}>Grant Camera Permission</Text>
           </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.secondaryBtn}
+            onPress={() => setManualModalVisible(true)}
+          >
+            <Text style={styles.secondaryBtnText}>Enter Code Manually</Text>
+          </TouchableOpacity>
         </View>
+
+        {renderManualModal()}
       </SafeAreaView>
     );
   }
@@ -119,8 +168,60 @@ export default function QRScannerScreen({ navigation }: any) {
           <Text style={styles.permissionDesc}>
             No rear camera device detected on this phone.
           </Text>
+          <TouchableOpacity
+            style={styles.primaryBtn}
+            onPress={() => setManualModalVisible(true)}
+          >
+            <Text style={styles.primaryBtnText}>Enter Code Manually</Text>
+          </TouchableOpacity>
         </View>
+
+        {renderManualModal()}
       </SafeAreaView>
+    );
+  }
+
+  function renderManualModal() {
+    return (
+      <Modal
+        visible={manualModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setManualModalVisible(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Manual QR Input</Text>
+            <Text style={styles.modalDesc}>
+              Paste or enter the permanent classroom JSON payload or short code:
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="e.g. { &quot;terminal_id&quot;: &quot;...&quot; }"
+              placeholderTextColor="#64748b"
+              value={manualInputText}
+              onChangeText={setManualInputText}
+              multiline
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => {
+                  setManualModalVisible(false);
+                  setManualInputText('');
+                }}
+              >
+                <Text style={styles.modalCancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalSubmitBtn} onPress={handleManualSubmit}>
+                <Text style={styles.modalSubmitBtnText}>Validate & Check In</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     );
   }
 
@@ -128,12 +229,12 @@ export default function QRScannerScreen({ navigation }: any) {
     <View style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#000" />
 
-      {/* Rear Camera Preview */}
+      {/* Rear Camera Preview with photoOutput for MLKit frame analysis */}
       <Camera
         style={StyleSheet.absoluteFill}
         device={device}
         isActive={isFocused && !isProcessing}
-        outputs={[objectOutput]}
+        outputs={[photoOutput]}
         torchMode={torch ? 'on' : 'off'}
       />
 
@@ -191,7 +292,15 @@ export default function QRScannerScreen({ navigation }: any) {
           <Text style={styles.footerNote}>
             Each classroom has a permanent QR code on the wall or attendance box.
           </Text>
+          <TouchableOpacity
+            style={styles.manualEntryBtn}
+            onPress={() => setManualModalVisible(true)}
+          >
+            <Text style={styles.manualEntryBtnText}>⌨️ Enter Code Manually</Text>
+          </TouchableOpacity>
         </View>
+
+        {renderManualModal()}
       </SafeAreaView>
     </View>
   );
@@ -248,7 +357,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     width: 28,
     height: 28,
-    borderColor: '#38bdf8', // bright accent cyan/blue for high visibility
+    borderColor: '#38bdf8',
   },
   cornerTL: {
     top: 0,
@@ -336,6 +445,18 @@ const styles = StyleSheet.create({
     color: '#94a3b8',
     fontSize: T.fontSize.xs,
     textAlign: 'center',
+    marginBottom: 8,
+  },
+  manualEntryBtn: {
+    paddingVertical: T.spacing.xs,
+    paddingHorizontal: T.spacing.md,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderRadius: T.radius.md,
+  },
+  manualEntryBtnText: {
+    color: '#38bdf8',
+    fontSize: T.fontSize.xs,
+    fontWeight: '700',
   },
   centerContent: {
     flex: 1,
@@ -371,6 +492,78 @@ const styles = StyleSheet.create({
   primaryBtnText: {
     color: '#fff',
     fontSize: T.fontSize.base,
+    fontWeight: '700',
+  },
+  secondaryBtn: {
+    marginTop: 12,
+    paddingVertical: T.spacing.sm,
+    paddingHorizontal: T.spacing.lg,
+  },
+  secondaryBtnText: {
+    color: '#38bdf8',
+    fontSize: T.fontSize.sm,
+    fontWeight: '600',
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    padding: T.spacing.lg,
+  },
+  modalContent: {
+    backgroundColor: '#1e293b',
+    borderRadius: T.radius.xl,
+    padding: T.spacing.xl,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  modalTitle: {
+    color: '#fff',
+    fontSize: T.fontSize.lg,
+    fontWeight: '800',
+    marginBottom: 6,
+  },
+  modalDesc: {
+    color: '#94a3b8',
+    fontSize: T.fontSize.xs,
+    marginBottom: 16,
+    lineHeight: 18,
+  },
+  modalInput: {
+    backgroundColor: '#0f172a',
+    borderColor: '#334155',
+    borderWidth: 1,
+    borderRadius: T.radius.md,
+    color: '#fff',
+    padding: T.spacing.md,
+    minHeight: 100,
+    textAlignVertical: 'top',
+    fontSize: T.fontSize.sm,
+    marginBottom: 16,
+  },
+  modalBtnRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 12,
+  },
+  modalCancelBtn: {
+    paddingVertical: T.spacing.sm,
+    paddingHorizontal: T.spacing.md,
+  },
+  modalCancelBtnText: {
+    color: '#94a3b8',
+    fontSize: T.fontSize.sm,
+    fontWeight: '600',
+  },
+  modalSubmitBtn: {
+    backgroundColor: T.colors.primary,
+    paddingVertical: T.spacing.sm,
+    paddingHorizontal: T.spacing.lg,
+    borderRadius: T.radius.md,
+  },
+  modalSubmitBtnText: {
+    color: '#fff',
+    fontSize: T.fontSize.sm,
     fontWeight: '700',
   },
 });
